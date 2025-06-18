@@ -13,6 +13,7 @@ mcp = FastMCP("outlook-assistant")
 # Constants
 MAX_DAYS = 180
 ACTIONABLE_EMAIL_MAX_DAYS = 60
+
 # Email cache for storing retrieved emails by number
 email_cache = {}
 
@@ -183,6 +184,33 @@ def get_todays_appointments(namespace) -> List[Dict[str, Any]]:
     appointments_list.sort(key=lambda x: x["start"])
     return appointments_list
 
+def get_todays_tasks(namespace) -> List[Dict[str, Any]]:
+    """Fetches incomplete Outlook tasks due on or before today."""
+    tasks_list = []
+    try:
+        tasks_folder = namespace.GetDefaultFolder(13) # 13 is Tasks folder
+        items = tasks_folder.Items
+        items.Sort("[DueDate]")
+        items.IncludeRecurrences = True # Important for recurring tasks
+
+        today_str = datetime.date.today().strftime('%m/%d/%Y')
+
+        # Filter for tasks that are not complete and are due on or before today (includes overdue)
+        restriction = f"[Complete] = false AND [DueDate] <= '{today_str}'"
+        
+        restricted_items = items.Restrict(restriction)
+
+        for item in restricted_items:
+            # Check if it's actually a task item (olTask = 48)
+            if hasattr(item, 'Class') and item.Class == 48:
+                tasks_list.append({
+                    "subject": item.Subject,
+                    "due_date": item.DueDate.strftime('%Y-%m-%d') if hasattr(item, 'DueDate') and item.DueDate else "No due date"
+                })
+    except Exception as e:
+        print(f"Warning: Could not retrieve Outlook tasks: {e}")
+
+    return tasks_list
 
 def clear_email_cache():
     """Clear the email cache"""
@@ -264,10 +292,280 @@ def get_emails_from_folder(folder, days: int, search_term: Optional[str] = None)
         
     return emails_list
 
+@mcp.tool()
+def create_outlook_task(subject: str, due_date_str: str, reminder_time_str: Optional[str] = None) -> str:
+    """
+    Creates a new task in Outlook's To-Do list.
+
+    Args:
+        subject: The subject or name of the task (e.g., "Follow up on project proposal").
+        due_date_str: The date the task is due. Can be a string like "tomorrow", "next Friday", or "2024-10-31".
+        reminder_time_str: Optional. The time for a reminder (e.g., "9:00 AM"). If provided, a reminder will be set.
+
+    Returns:
+        A confirmation message indicating success or failure.
+    """
+    print(f"Tool: create_outlook_task called with subject='{subject}', due_date='{due_date_str}', reminder_time='{reminder_time_str}'")
+    try:
+        outlook, _ = connect_to_outlook()
+        task = outlook.CreateItem(3) # 3 represents olTaskItem
+        task.Subject = subject
+        task.DueDate = due_date_str # win32com is smart enough to parse "tomorrow", "next monday", etc.
+
+        if reminder_time_str:
+            task.ReminderSet = True
+            # The COM object can often parse combined date/time strings correctly.
+            task.ReminderTime = f"{due_date_str} {reminder_time_str}"
+
+        task.Save()
+        # To provide better feedback, let's get the actual parsed due date.
+        actual_due_date = task.DueDate.strftime('%A, %B %d, %Y')
+        msg = f"Success: Task '{subject}' created, due on {actual_due_date}."
+        if task.ReminderSet:
+            actual_reminder_time = task.ReminderTime.strftime('%I:%M %p').lstrip('0')
+            msg += f" A reminder is set for {actual_reminder_time}."
+        return msg
+    except Exception as e:
+        return f"Error creating Outlook task: {str(e)}"
+
+@mcp.tool()
+def get_outlook_tasks(due: str = 'today') -> str:
+    """
+    Retrieves incomplete tasks from Outlook based on their due date.
+
+    Args:
+        due: A filter for which tasks to retrieve. Can be 'today', 'tomorrow', 'this week', or 'all'. Defaults to 'today'.
+
+    Returns:
+        A JSON string representing a list of due tasks, or a message if none are found.
+    """
+    print(f"Tool: get_outlook_tasks called with due='{due}'")
+    due = due.lower().strip()
+    if due not in ['today', 'tomorrow', 'this week', 'all']:
+        return "Error: Invalid 'due' parameter. Must be one of 'today', 'tomorrow', 'this week', or 'all'."
+
+    try:
+        _, namespace = connect_to_outlook()
+        tasks_folder = namespace.GetDefaultFolder(13) # 13 is Tasks folder
+        items = tasks_folder.Items
+        items.Sort("[DueDate]")
+        items.IncludeRecurrences = True
+
+        # Build filter string
+        today = datetime.date.today()
+        # Use a format Outlook understands well in filters
+        today_str = today.strftime('%m/%d/%Y')
+
+        if due == 'today':
+            # Includes overdue tasks
+            restriction = f"[Complete] = false AND [DueDate] <= '{today_str}'"
+        elif due == 'tomorrow':
+            tomorrow = today + datetime.timedelta(days=1)
+            tomorrow_str = tomorrow.strftime('%m/%d/%Y')
+            restriction = f"[Complete] = false AND [DueDate] = '{tomorrow_str}'"
+        elif due == 'this week':
+            start_of_week = today - datetime.timedelta(days=today.weekday())
+            end_of_week = start_of_week + datetime.timedelta(days=6)
+            start_str = start_of_week.strftime('%m/%d/%Y')
+            end_str = end_of_week.strftime('%m/%d/%Y')
+            restriction = f"[Complete] = false AND [DueDate] >= '{start_str}' AND [DueDate] <= '{end_str}'"
+        else: # 'all'
+            restriction = "[Complete] = false"
+
+        due_tasks = []
+        restricted_items = items.Restrict(restriction)
+
+        for item in restricted_items:
+            # olTask = 48
+            if hasattr(item, 'Class') and item.Class == 48:
+                 due_tasks.append({
+                    "subject": item.Subject,
+                    "due_date": item.DueDate.strftime('%Y-%m-%d') if hasattr(item, 'DueDate') and item.DueDate else "No due date",
+                    "reminder_set": item.ReminderSet
+                })
+
+        if not due_tasks:
+            return json.dumps({"message": f"No incomplete tasks found for the '{due}' category."})
+
+        return json.dumps(due_tasks, indent=2)
+
+    except Exception as e:
+        return f"Error retrieving Outlook tasks: {str(e)}"
+
+@mcp.tool()
+def mark_task_complete(task_subject: str) -> str:
+    """
+    Finds an incomplete task by its exact subject and marks it as complete.
+
+    Args:
+        task_subject: The exact subject of the task to mark as complete.
+
+    Returns:
+        A confirmation message.
+    """
+    print(f"Tool: mark_task_complete called for subject='{task_subject}'")
+    try:
+        _, namespace = connect_to_outlook()
+        tasks_folder = namespace.GetDefaultFolder(13) # 13 is Tasks folder
+        
+        # Using a simple filter is generally safer than a raw SQL-style one
+        restriction = f"[Subject] = '{task_subject}' AND [Complete] = False"
+        tasks = tasks_folder.Items.Restrict(restriction)
+        
+        if tasks.Count == 0:
+            return f"Error: No active task with the subject '{task_subject}' was found."
+        
+        if tasks.Count > 1:
+            print(f"Warning: Found {tasks.Count} active tasks with the same subject. Completing the first one found.")
+
+        # Get the first task from the filtered results
+        task_to_complete = tasks.Item(1)
+        task_to_complete.MarkComplete() # This is the dedicated method for a TaskItem
+
+        return f"Success: Task '{task_subject}' has been marked as complete."
+    except Exception as e:
+        return f"Error marking task as complete: {str(e)}"
+
+@mcp.tool()
+def generate_morning_briefing(days_to_scan: int = 3, follow_up_days: int = 2) -> str:
+    """
+    **OPTIMIZED FOR AI ANALYSIS & NOW INCLUDES OUTLOOK TASKS**
+    Gathers all data for a comprehensive morning briefing.
+
+    This tool acts as a data aggregator. It fetches calendar appointments for today, analyzes
+    recent email conversations, and **retrieves any due Outlook tasks**. It then returns a structured
+    JSON object containing all this raw data.
+
+    Your task is to analyze the returned JSON to construct a user-friendly briefing. Identify:
+    1.  **Today's Tasks**: Check the `todays_reminders` section first (this contains due tasks).
+    2.  **Today's Schedule**: Review the `todays_calendar` section.
+    3.  **Email Priorities**: Analyze `conversation_threads` for urgent items, replies needed, and follow-ups.
+    4.  Synthesize these points into a clear, actionable summary for the user.
+
+    Args:
+        days_to_scan: How many days back to scan for relevant email threads (default 3, max 14).
+        follow_up_days: The number of days to wait before an item might be considered "awaiting reply" (default 2).
+
+    Returns:
+        A JSON string containing calendar data, a list of active conversation threads, and today's due tasks.
+    """
+    print(f"Tool: generate_morning_briefing (AI-driven) called with days_to_scan={days_to_scan}, follow_up_days={follow_up_days}")
+    if not isinstance(days_to_scan, int) or not 1 <= days_to_scan <= 14:
+        return "Error: 'days_to_scan' must be an integer between 1 and 14."
+    if not isinstance(follow_up_days, int) or follow_up_days < 1:
+        return "Error: 'follow_up_days' must be a positive integer."
+    
+    try:
+        # 1. Data Collection
+        _, namespace = connect_to_outlook()
+        my_email = get_my_email_address(namespace)
+        if not my_email:
+            return "Error: Could not determine your email address. Cannot analyze conversations."
+
+        manager_name = get_manager_name(namespace)
+        inbox = namespace.GetDefaultFolder(6)
+        sent_folder = namespace.GetDefaultFolder(5)
+
+        # -- Calendar Data --
+        todays_appointments = get_todays_appointments(namespace)
+        # Convert datetime objects to strings for clean JSON serialization
+        for app in todays_appointments:
+            app['start'] = app['start'].strftime('%I:%M %p').lstrip('0')
+            app['end'] = app['end'].strftime('%I:%M %p').lstrip('0')
+
+        # -- Email Data --
+        start_date = datetime.datetime.now() - datetime.timedelta(days=days_to_scan)
+        start_date_str = start_date.strftime('%m/%d/%Y %H:%M %p')
+        
+        inbox_items = inbox.Items.Restrict(f"[ReceivedTime] >= '{start_date_str}'")
+        sent_items = sent_folder.Items.Restrict(f"[SentOn] >= '{start_date_str}'")
+        all_items = list(inbox_items) + list(sent_items)
+        
+        conversations = {}
+        for item in all_items:
+            try:
+                conv_id = item.ConversationID
+                if conv_id not in conversations: conversations[conv_id] = []
+                conversations[conv_id].append(item)
+            except Exception: continue
+
+        def get_item_datetime(item):
+            dt = getattr(item, 'ReceivedTime', None) or getattr(item, 'SentOn', None)
+            return dt.replace(tzinfo=None) if dt else datetime.datetime.min
+
+        for conv_id in conversations:
+            conversations[conv_id].sort(key=get_item_datetime)
+
+        # 2. Data Processing for AI
+        clear_email_cache()
+        email_number = 1
+        threads_for_ai = []
+
+        for conv_id, thread in conversations.items():
+            if not thread: continue
+            
+            last_email_item = thread[-1]
+            last_email_data = format_email(last_email_item)
+            
+            # Cache the full data for other tools
+            email_cache[email_number] = last_email_data
+
+            is_from_me = my_email in last_email_data.get('sender_email', '').lower() if last_email_data.get('sender_email') else False
+            
+            time_since_last_email = datetime.datetime.now() - get_item_datetime(last_email_item)
+            
+            thread_status = {
+                "email_number": email_number,
+                "subject": last_email_data.get('subject'),
+                "last_email_from": "me" if is_from_me else last_email_data.get('sender'),
+                "last_email_timestamp": get_item_datetime(last_email_item).strftime('%Y-%m-%d %H:%M'),
+                "is_last_email_unread": last_email_data.get('unread', False) and not is_from_me,
+                "is_from_manager": manager_name and manager_name.lower() in last_email_data.get('sender', '').lower(),
+                "contains_question_in_body": '?' in last_email_data.get('body', ''),
+                "days_since_last_email": time_since_last_email.days
+            }
+            
+            # Add context for the AI to decide if a follow-up is needed
+            if is_from_me and time_since_last_email.days >= follow_up_days:
+                thread_status["follow_up_suggestion"] = f"Awaiting reply for {time_since_last_email.days} days."
+            
+            threads_for_ai.append(thread_status)
+            email_number += 1
+
+        # -- Fetch Today's Outlook Tasks --
+        todays_tasks = get_todays_tasks(namespace)
+        
+        # 3. Construct Final JSON Payload
+        briefing_data = {
+            "briefing_metadata": {
+                "date": datetime.date.today().strftime('%A, %B %d, %Y'),
+                "user_email": my_email,
+                "manager_name": manager_name or "Not found"
+            },
+            "todays_reminders": todays_tasks, # Key is "reminders" for consistent AI interpretation, value is today's tasks
+            "todays_calendar": todays_appointments,
+            "conversation_threads": sorted(
+                threads_for_ai,
+                key=lambda x: (not x['is_last_email_unread'], x['last_email_timestamp']),
+                reverse=True
+            ),
+             "analysis_instructions": "Review reminders (which are Outlook tasks), calendar, and conversation_threads to create a prioritized morning briefing for the user."
+        }
+
+        return json.dumps(briefing_data, indent=2)
+
+    except Exception as e:
+        error_payload = {
+            "status": "error",
+            "message": f"An error occurred while gathering briefing data: {str(e)}"
+        }
+        return json.dumps(error_payload, indent=2)
+
 # MCP Tools
 @mcp.tool()
 def prioritize_inbox(days: int = 1, max_emails_to_scan: int = 25) -> str:
     """
+    **OPTIMIZED FOR AI ANALYSIS**
     Fetches recent emails from the inbox for AI-powered prioritization.
 
     This tool does NOT rank emails itself. Instead, it gathers raw email data (sender, subject, body snippet)
@@ -279,7 +577,7 @@ def prioritize_inbox(days: int = 1, max_emails_to_scan: int = 25) -> str:
     human-readable summary to the user, explaining WHY each email is a priority.
 
     Args:
-        days: Number of days to look back for emails (default 1, max 7). A smaller number is better to keep the data manageable.
+        days: Number of days to look back for emails (default 1, max 31). A smaller number is better to keep the data manageable.
         max_emails_to_scan: The maximum number of emails to retrieve for analysis (default 25).
 
     Returns:
@@ -291,8 +589,8 @@ def prioritize_inbox(days: int = 1, max_emails_to_scan: int = 25) -> str:
     print(f"Tool: prioritize_inbox (AI-driven) called with days={days}, max_emails_to_scan={max_emails_to_scan}")
 
     # Parameter validation
-    if not isinstance(days, int) or not 1 <= days <= 7:
-        return "Error: 'days' must be an integer between 1 and 7 for AI analysis."
+    if not isinstance(days, int) or not 1 <= days <= 31:
+        return "Error: 'days' must be an integer between 1 and 31 for AI analysis."
     if not isinstance(max_emails_to_scan, int) or not 5 <= max_emails_to_scan <= 50:
         return "Error: 'max_emails_to_scan' must be between 5 and 50."
 
@@ -340,6 +638,132 @@ def prioritize_inbox(days: int = 1, max_emails_to_scan: int = 25) -> str:
     except Exception as e:
         return f"Error fetching emails for AI analysis: {str(e)}"
 
+@mcp.tool()
+def inbox_load_and_mood_estimator(days_to_scan: int = 30) -> str:
+    """
+    **OPTIMIZED FOR AI ANALYSIS**
+    Calculates key metrics about the inbox for AI-powered 'load' or 'stress' analysis.
+
+    This tool does NOT calculate a 'load score' or 'mood'. Instead, it provides raw metrics
+    like the count of urgent emails, flagged items, and average response delay.
+    YOU, the AI assistant, must interpret these metrics to assess the overall state
+    of the user's inbox and provide a qualitative summary (e.g., 'calm', 'busy', 'overloaded')
+    and suggest a course of action.
+
+    Args:
+        days_to_scan: How many days back to scan for emails to calculate metrics (max 60).
+
+    Returns:
+        A JSON string containing key performance indicators for the inbox, such as:
+        'unread_urgent_count', 'flagged_threads_count', 'average_response_delay_hours',
+        and 'total_active_conversations'.
+    """
+    print(f"Tool: inbox_load_and_mood_estimator (AI-driven) called with days_to_scan={days_to_scan}")
+    if not isinstance(days_to_scan, int) or not 1 <= days_to_scan <= ACTIONABLE_EMAIL_MAX_DAYS:
+        return f"Error: 'days_to_scan' must be an integer between 1 and {ACTIONABLE_EMAIL_MAX_DAYS}."
+
+    try:
+        _, namespace = connect_to_outlook()
+        my_email = get_my_email_address(namespace)
+        if not my_email:
+            return "Error: Could not determine your email address. Cannot estimate inbox load."
+
+        inbox = namespace.GetDefaultFolder(6)
+        sent_folder = namespace.GetDefaultFolder(5)
+        
+        start_date = datetime.datetime.now() - datetime.timedelta(days=days_to_scan)
+        start_date_str = start_date.strftime('%m/%d/%Y %H:%M %p')
+
+        inbox_items = inbox.Items.Restrict(f"[ReceivedTime] >= '{start_date_str}'")
+        sent_items = sent_folder.Items.Restrict(f"[SentOn] >= '{start_date_str}'")
+        all_items = list(inbox_items) + list(sent_items)
+
+        # Bilingual keywords for analysis
+        URGENT_KEYWORDS = [
+            # English
+            "urgent", "action required", "asap", "deadline", "critical",
+            # Afrikaans
+            "dringend", "aksie vereis", "sgm", "sperdatum", "krities", "belangrik", "spoedig", "gou", "NB"
+        ]
+
+        unread_urgent_count = 0
+        flagged_threads_count = 0
+        total_response_delay_seconds = 0
+        replied_to_count = 0
+        
+        conversations = {}
+        for item in all_items:
+            try:
+                conv_id = item.ConversationID
+                if conv_id not in conversations:
+                    conversations[conv_id] = []
+                conversations[conv_id].append(item)
+            except Exception as e:
+                print(f"Warning: Could not get ConversationID for an item, skipping: {e}")
+                continue
+
+        # Sort threads to analyze chronologically
+        def get_item_datetime(item):
+            dt = getattr(item, 'ReceivedTime', None) or getattr(item, 'SentOn', None)
+            return dt.replace(tzinfo=None) if dt else datetime.datetime.min
+
+        for conv_id, thread in conversations.items():
+            if not thread: continue
+            thread.sort(key=get_item_datetime)
+
+            last_email = thread[-1]
+            last_sender_addr = getattr(last_email, 'SenderEmailAddress', '').lower()
+            
+            # Metric 1: Unread Urgent Count
+            if getattr(last_email, 'UnRead', False) and last_sender_addr != my_email:
+                subject_lower = getattr(last_email, 'Subject', '').lower()
+                if any(kw in subject_lower for kw in URGENT_KEYWORDS):
+                    unread_urgent_count += 1
+            
+            # Metric 2: Flagged Threads Count
+            if any(getattr(item, 'FlagStatus', 0) == 2 for item in thread): # olFlagged
+                flagged_threads_count += 1
+
+            # Metric 3: Average Response Delay
+            for i in range(len(thread) - 1):
+                current_item = thread[i]
+                next_item = thread[i+1]
+                
+                # Check for a reply pattern: their email -> my email
+                if getattr(current_item, 'SenderEmailAddress', '').lower() != my_email and getattr(next_item, 'SenderEmailAddress', '').lower() == my_email:
+                    time_in = get_item_datetime(current_item)
+                    time_out = get_item_datetime(next_item)
+                    if time_out > time_in:
+                        delay = (time_out - time_in).total_seconds()
+                        total_response_delay_seconds += delay
+                        replied_to_count += 1
+
+        # Finalize Metrics
+        avg_response_delay_hours = (total_response_delay_seconds / replied_to_count / 3600) if replied_to_count > 0 else 0
+        
+        # Construct the JSON payload for the AI
+        result = {
+            "analysis_metadata": {
+                "scan_period_days": days_to_scan,
+                "timestamp": datetime.datetime.now().isoformat()
+            },
+            "inbox_metrics": {
+                "unread_urgent_count": unread_urgent_count,
+                "flagged_threads_count": flagged_threads_count,
+                "average_response_delay_hours": round(avg_response_delay_hours, 2),
+                "total_active_conversations": len(conversations)
+            },
+            "ai_instructions": "Analyze these metrics to assess the user's inbox load and provide a qualitative summary and recommendations."
+        }
+        
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        error_payload = {
+            "status": "error",
+            "message": f"An error occurred while calculating inbox metrics: {str(e)}"
+        }
+        return json.dumps(error_payload, indent=2)
 
 @mcp.tool()
 def list_folders() -> str:
@@ -593,449 +1017,6 @@ def get_email_by_number(email_number: int) -> str:
     
     except Exception as e:
         return f"Error retrieving email details: {str(e)}"
-
-
-@mcp.tool()
-def generate_morning_briefing(days_to_scan: int = 3, follow_up_days: int = 2) -> str:
-    """
-    Gathers all data for a comprehensive morning briefing for AI-powered analysis.
-
-    This tool acts as a data aggregator. It fetches calendar appointments for today and analyzes
-    recent email conversations. It then returns a structured JSON object containing this raw data.
-    YOU, the AI assistant, must interpret this JSON to construct a user-friendly morning briefing.
-
-    Your task is to analyze the returned data to identify:
-    1.  The user's schedule for the day from the 'todays_calendar' section.
-    2.  High-priority emails (e.g., from a manager, unread, urgent-sounding content).
-    3.  Threads where the user needs to reply (last email is from someone else).
-    4.  Threads where the user is awaiting a reply (last email is from the user).
-    5.  Synthesize these points into a clear, actionable summary for the user.
-
-    Args:
-        days_to_scan: How many days back to scan for relevant email threads (default 3, max 14).
-        follow_up_days: The number of days to wait before an item might be considered "awaiting reply" (default 2).
-
-    Returns:
-        A JSON string containing calendar data and a list of active conversation threads.
-        Each thread includes an 'email_number' for use with other tools like `get_email_by_number`.
-    """
-    print(f"Tool: generate_morning_briefing (AI-driven) called with days_to_scan={days_to_scan}, follow_up_days={follow_up_days}")
-    if not isinstance(days_to_scan, int) or not 1 <= days_to_scan <= 14:
-        return "Error: 'days_to_scan' must be an integer between 1 and 14."
-    if not isinstance(follow_up_days, int) or follow_up_days < 1:
-        return "Error: 'follow_up_days' must be a positive integer."
-
-    try:
-        # 1. Data Collection
-        _, namespace = connect_to_outlook()
-        my_email = get_my_email_address(namespace)
-        if not my_email:
-            return "Error: Could not determine your email address. Cannot analyze conversations."
-
-        manager_name = get_manager_name(namespace)
-        inbox = namespace.GetDefaultFolder(6)
-        sent_folder = namespace.GetDefaultFolder(5)
-
-        # -- Calendar Data --
-        todays_appointments = get_todays_appointments(namespace)
-        # Convert datetime objects to strings for clean JSON serialization
-        for app in todays_appointments:
-            app['start'] = app['start'].strftime('%I:%M %p').lstrip('0')
-            app['end'] = app['end'].strftime('%I:%M %p').lstrip('0')
-
-        # -- Email Data --
-        start_date = datetime.datetime.now() - datetime.timedelta(days=days_to_scan)
-        start_date_str = start_date.strftime('%m/%d/%Y %H:%M %p')
-        
-        inbox_items = inbox.Items.Restrict(f"[ReceivedTime] >= '{start_date_str}'")
-        sent_items = sent_folder.Items.Restrict(f"[SentOn] >= '{start_date_str}'")
-        all_items = list(inbox_items) + list(sent_items)
-        
-        conversations = {}
-        for item in all_items:
-            try:
-                conv_id = item.ConversationID
-                if conv_id not in conversations: conversations[conv_id] = []
-                conversations[conv_id].append(item)
-            except Exception: continue
-
-        def get_item_datetime(item):
-            dt = getattr(item, 'ReceivedTime', None) or getattr(item, 'SentOn', None)
-            return dt.replace(tzinfo=None) if dt else datetime.datetime.min
-
-        for conv_id in conversations:
-            conversations[conv_id].sort(key=get_item_datetime)
-
-        # 2. Data Processing for AI
-        clear_email_cache()
-        email_number = 1
-        threads_for_ai = []
-
-        for conv_id, thread in conversations.items():
-            if not thread: continue
-            
-            last_email_item = thread[-1]
-            last_email_data = format_email(last_email_item)
-            
-            # Cache the full data for other tools
-            email_cache[email_number] = last_email_data
-
-            is_from_me = my_email in last_email_data.get('sender_email', '').lower() if last_email_data.get('sender_email') else False
-            
-            time_since_last_email = datetime.datetime.now() - get_item_datetime(last_email_item)
-            
-            thread_status = {
-                "email_number": email_number,
-                "subject": last_email_data.get('subject'),
-                "last_email_from": "me" if is_from_me else last_email_data.get('sender'),
-                "last_email_timestamp": get_item_datetime(last_email_item).strftime('%Y-%m-%d %H:%M'),
-                "is_last_email_unread": last_email_data.get('unread', False) and not is_from_me,
-                "is_from_manager": manager_name and manager_name.lower() in last_email_data.get('sender', '').lower(),
-                "contains_question_in_body": '?' in last_email_data.get('body', ''),
-                "days_since_last_email": time_since_last_email.days
-            }
-            
-            # Add context for the AI to decide if a follow-up is needed
-            if is_from_me and time_since_last_email.days >= follow_up_days:
-                thread_status["follow_up_suggestion"] = f"Awaiting reply for {time_since_last_email.days} days."
-            
-            threads_for_ai.append(thread_status)
-            email_number += 1
-            
-        # 3. Construct Final JSON Payload
-        briefing_data = {
-            "briefing_metadata": {
-                "date": datetime.date.today().strftime('%A, %B %d, %Y'),
-                "email_scan_days": days_to_scan,
-                "user_email": my_email,
-                "manager_name": manager_name or "Not found"
-            },
-            "todays_calendar": todays_appointments,
-            "conversation_threads": sorted(
-                threads_for_ai,
-                key=lambda x: (not x['is_last_email_unread'], x['last_email_timestamp']),
-                reverse=True
-            ),
-             "analysis_instructions": "Review calendar and conversation_threads to create a prioritized morning briefing for the user."
-        }
-
-        # Return the structured data for the AI to process
-        return json.dumps(briefing_data, indent=2)
-
-    except Exception as e:
-        # Provide a specific error message in a JSON format
-        error_payload = {
-            "status": "error",
-            "message": f"An error occurred while gathering briefing data: {str(e)}"
-        }
-        return json.dumps(error_payload, indent=2)
-
-@mcp.tool()
-def get_actionable_emails(days_to_scan: int = 30, limit_per_category: int = 5) -> str:
-    """
-    Analyzes the inbox to identify all emails needing attention and categorizes them.
-
-    This powerful tool scans your Inbox and Sent Items to understand the state of
-    conversations. It categorizes emails into:
-    1.  Unread Priority Emails: Important emails you have not yet read.
-    2.  Awaiting Your Reply: Emails you have read but likely need to respond to.
-    3.  Pending Your Follow-up: Emails you sent that have not yet received a reply.
-
-    Args:
-        days_to_scan: How many days back to scan for relevant emails (max 60).
-        limit_per_category: The maximum number of emails to show in each category.
-
-    Returns:
-        A formatted string summarizing all actionable emails.
-    """
-    print(f"Tool: get_actionable_emails called with days={days_to_scan}, limit={limit_per_category}")
-    if not isinstance(days_to_scan, int) or not 1 <= days_to_scan <= ACTIONABLE_EMAIL_MAX_DAYS:
-        return f"Error: 'days_to_scan' must be an integer between 1 and {ACTIONABLE_EMAIL_MAX_DAYS}."
-    if not isinstance(limit_per_category, int) or limit_per_category < 1:
-        return "Error: 'limit_per_category' must be a positive integer."
-
-    try:
-        # 1. Data Collection & Pre-processing
-        _, namespace = connect_to_outlook()
-        my_email = get_my_email_address(namespace)
-        if not my_email:
-            return "Error: Could not determine your email address. Cannot analyze conversations."
-        
-        manager_name = get_manager_name(namespace)
-        
-        inbox = namespace.GetDefaultFolder(6)
-        sent_folder = namespace.GetDefaultFolder(5)
-        
-        start_date = datetime.datetime.now() - datetime.timedelta(days=days_to_scan)
-        start_date_str = start_date.strftime('%m/%d/%Y %H:%M %p')
-
-        inbox_items = inbox.Items.Restrict(f"[ReceivedTime] >= '{start_date_str}'")
-        sent_items = sent_folder.Items.Restrict(f"[SentOn] >= '{start_date_str}'")
-        all_items = list(inbox_items) + list(sent_items)
-        
-        # 2. Conversation Grouping
-        conversations = {}
-        for item in all_items:
-            try:
-                conv_id = item.ConversationID
-                if conv_id not in conversations:
-                    conversations[conv_id] = []
-                conversations[conv_id].append(item)
-            except Exception as e:
-                # Log error and skip item if ConversationID is problematic
-                print(f"Warning: Could not get ConversationID for an item, skipping: {e}")
-                continue # Skip items without a conversation ID
-
-        # Safely get datetime for sorting
-        def get_item_datetime_for_sorting(item):
-            # Prefer SentOn if available and it's a datetime object
-            if hasattr(item, 'SentOn') and isinstance(item.SentOn, datetime.datetime):
-                return item.SentOn.replace(tzinfo=None)
-            # Otherwise, use ReceivedTime if available and it's a datetime object
-            elif hasattr(item, 'ReceivedTime') and isinstance(item.ReceivedTime, datetime.datetime):
-                return item.ReceivedTime.replace(tzinfo=None)
-            return datetime.datetime.min # Return a very old date for items without valid dates
-
-        for conv_id in conversations:
-            conversations[conv_id].sort(key=get_item_datetime_for_sorting)
-
-        # 3. The Analysis Engine
-        results = {
-            "unread_priority": [],
-            "awaiting_reply": [],
-            "pending_followup": []
-        }
-        
-        # Bilingual keywords for analysis
-        URGENT_KEYWORDS = [
-            # English
-            "urgent", "action required",
-            # Afrikaans
-            "dringend", "aksie vereis", "sgm", "sperdatum", "krities", "belangrik", "spoedig", "gou", "NB"
-        ]
-
-        for conv_id, thread in conversations.items():
-            if not thread: continue
-            
-            last_email = thread[-1]
-            last_sender_addr = getattr(last_email, 'SenderEmailAddress', '').lower()
-            
-            # Rule for Category 1: Unread Priority Emails
-            if getattr(last_email, 'UnRead', False) and last_sender_addr != my_email:
-                reason = "Unread message"
-                kw_found = next((kw for kw in URGENT_KEYWORDS if kw in getattr(last_email, 'Subject', '').lower()), None)
-
-                if manager_name and manager_name.lower() in getattr(last_email, 'SenderName', '').lower():
-                    reason = "Unread message from your manager"
-                elif "vip" in getattr(last_email, 'Categories', '').lower():
-                    reason = "Unread message from a VIP"
-                elif kw_found:
-                    reason = f"Unread message with '{kw_found}' in the subject"
-                
-                results["unread_priority"].append({'email': last_email, 'reason': reason})
-                continue
-
-            # Rule for Category 2: Awaiting Your Reply
-            if last_sender_addr != my_email:
-                if '?' in getattr(last_email, 'Body', ''):
-                    reason = "You've read this, but the last message from them asks a question."
-                    results["awaiting_reply"].append({'email': last_email, 'reason': reason})
-                continue
-            
-            # Rule for Category 3: Pending Your Follow-up
-            if last_sender_addr == my_email:
-                time_since_sent = datetime.datetime.now() - get_item_datetime_for_sorting(last_email)
-                if time_since_sent > datetime.timedelta(days=2) and '?' in getattr(last_email, 'Body', ''):
-                    days_ago = time_since_sent.days
-                    reason = f"You sent this email with a question {days_ago} days ago and have not received a reply."
-                    results["pending_followup"].append({'email': last_email, 'reason': reason})
-                continue
-
-        # 4. Formatting and Returning the Report
-        clear_email_cache()
-        output = [f"Here is a summary of emails that need your attention, scanned from the last {days_to_scan} days:\n"]
-        email_number = 1
-        
-        category_map = {
-            "unread_priority": "UNREAD PRIORITY EMAILS",
-            "awaiting_reply": "AWAITING YOUR REPLY",
-            "pending_followup": "PENDING YOUR FOLLOW-UP"
-        }
-
-        total_found = 0
-        for key, title in category_map.items():
-            items = results[key][:limit_per_category]
-            if not items: continue
-
-            total_found += len(items)
-            output.append(f"\n--- CATEGORY: {title} ({len(items)}) ---\n")
-            for item_data in items:
-                email = item_data['email']
-                reason = item_data['reason']
-                
-                email_dict = format_email(email)
-                email_cache[email_number] = email_dict
-
-                output.append(f"Email #{email_number}")
-                output.append(f"Subject: {email_dict['subject']}")
-                if email_dict['is_sent_item']:
-                    recipients_str = ', '.join([r.split('<')[0].strip() for r in email_dict.get('recipients', [])])
-                    output.append(f"To: {recipients_str}")
-                    output.append(f"Sent: {email_dict['sent_time']}")
-                else:
-                    output.append(f"From: {email_dict['sender']} <{email_dict['sender_email']}>")
-                    output.append(f"Received: {email_dict['received_time']}")
-                output.append(f"Reason: {reason}\n")
-                email_number += 1
-
-        if total_found == 0:
-            return "Your inbox is all caught up! No specific actions seem to be required based on a scan of the last {days_to_scan} days."
-            
-        output.append("\nTo get more details, use 'get_email_by_number <#>' or 'reply_to_email_by_number <#>, <reply_text>'.")
-        return "\n".join(output)
-
-    except Exception as e:
-        return f"Error analyzing actionable emails: {str(e)}"
-
-@mcp.tool()
-def inbox_load_and_mood_estimator(days_to_scan: int = 30) -> str:
-    """
-    Calculates the "load" or "stress" level of the current inbox based on various metrics.
-
-    This tool aggregates metrics such as the count of urgent and unread emails,
-    the number of flagged threads, and an estimated average response delay.
-    It returns a JSON object with a load score and a suggested action.
-
-    Args:
-        days_to_scan: How many days back to scan for emails to calculate metrics (max 60).
-
-    Returns:
-        A JSON string containing the load score and a suggested action.
-    """
-    print(f"Tool: inbox_load_and_mood_estimator called with days_to_scan={days_to_scan}")
-    if not isinstance(days_to_scan, int) or not 1 <= days_to_scan <= ACTIONABLE_EMAIL_MAX_DAYS:
-        return f"Error: 'days_to_scan' must be an integer between 1 and {ACTIONABLE_EMAIL_MAX_DAYS}."
-
-    try:
-        _, namespace = connect_to_outlook()
-        my_email = get_my_email_address(namespace)
-        if not my_email:
-            return "Error: Could not determine your email address. Cannot estimate inbox load."
-
-        inbox = namespace.GetDefaultFolder(6)
-        sent_folder = namespace.GetDefaultFolder(5)
-        
-        start_date = datetime.datetime.now() - datetime.timedelta(days=days_to_scan)
-        start_date_str = start_date.strftime('%m/%d/%Y %H:%M %p')
-
-        inbox_items = inbox.Items.Restrict(f"[ReceivedTime] >= '{start_date_str}'")
-        sent_items = sent_folder.Items.Restrict(f"[SentOn] >= '{start_date_str}'")
-        all_items = list(inbox_items) + list(sent_items)
-
-        # Bilingual keywords for analysis
-        URGENT_KEYWORDS = [
-            # English
-            "urgent", "action required", "asap", "deadline", "critical",
-            # Afrikaans
-            "dringend", "aksie vereis", "sgm", "sperdatum", "krities", "belangrik", "spoedig", "gou", "NB"
-        ]
-
-        unread_urgent_count = 0
-        flagged_threads_count = 0
-        total_response_delay_seconds = 0
-        replied_to_count = 0
-        
-        conversations = {}
-        for item in all_items:
-            try:
-                conv_id = item.ConversationID
-                if conv_id not in conversations:
-                    conversations[conv_id] = []
-                conversations[conv_id].append(item)
-            except Exception as e:
-                print(f"Warning: Could not get ConversationID for an item, skipping: {e}")
-                continue
-
-        for conv_id, thread in conversations.items():
-            if not thread: continue
-
-            # Sort thread by time to process chronologically
-            thread.sort(key=lambda x: getattr(x, 'ReceivedTime', datetime.datetime.min).replace(tzinfo=None) if hasattr(x, 'ReceivedTime') else datetime.datetime.min)
-
-            last_email = thread[-1]
-            last_sender_addr = getattr(last_email, 'SenderEmailAddress', '').lower()
-            
-            # Unread Urgent Count
-            if getattr(last_email, 'UnRead', False) and last_sender_addr != my_email:
-                subject_lower = getattr(last_email, 'Subject', '').lower()
-                if any(kw in subject_lower for kw in URGENT_KEYWORDS):
-                    unread_urgent_count += 1
-            
-            # Flagged Threads Count
-            if getattr(last_email, 'FlagStatus', 0) == 2: # olFlagged
-                flagged_threads_count += 1
-
-            # Average Response Delay
-            for i in range(len(thread)):
-                current_item = thread[i]
-                current_item_sender_addr = getattr(current_item, 'SenderEmailAddress', '').lower()
-                current_item_time = getattr(current_item, 'ReceivedTime', None)
-                if not current_item_time: continue
-                current_item_time = current_item_time.replace(tzinfo=None)
-
-                if current_item_sender_addr != my_email: # Incoming email
-                    for j in range(i + 1, len(thread)):
-                        next_item = thread[j]
-                        next_item_sender_addr = getattr(next_item, 'SenderEmailAddress', '').lower()
-                        next_item_time = getattr(next_item, 'SentOn', None)
-                        if not next_item_time: continue
-                        next_item_time = next_item_time.replace(tzinfo=None)
-
-                        if next_item_sender_addr == my_email and next_item_time > current_item_time: # My reply
-                            delay = (next_item_time - current_item_time).total_seconds()
-                            total_response_delay_seconds += delay
-                            replied_to_count += 1
-                            break # Found a reply for this incoming email
-
-        # Calculate Metrics
-        avg_response_delay_hours = (total_response_delay_seconds / replied_to_count / 3600) if replied_to_count > 0 else 0
-        total_active_emails = len(conversations)
-
-        # Load Score Calculation (adjust weights as needed)
-        load_score = 0.0
-        # Unread urgent emails contribute significantly
-        load_score += min(unread_urgent_count * 0.15, 0.5) # Max 0.5 for 3+ urgent emails
-        # Flagged threads indicate items needing attention
-        load_score += min(flagged_threads_count * 0.05, 0.3) # Max 0.3 for 6+ flagged emails
-        # High average response delay increases load
-        load_score += min(avg_response_delay_hours / 24 * 0.1, 0.2) # Max 0.2 for 24+ hours delay
-
-        load_score = round(min(load_score, 1.0), 2) # Cap at 1.0 and round
-
-        # Suggested Action
-        suggested_action = "Your inbox seems to be in good shape."
-        if unread_urgent_count > 0:
-            suggested_action = f"You have {unread_urgent_count} urgent and unread email{'s' if unread_urgent_count != 1 else ''}. Focus on those first."
-        elif flagged_threads_count > 0:
-            suggested_action = f"You have {flagged_threads_count} flagged email{'s' if flagged_threads_count != 1 else ''}. Review and act on them."
-        elif avg_response_delay_hours > 12:
-            suggested_action = f"Your average response time is {int(avg_response_delay_hours)} hours. Try to respond to recent emails promptly."
-        elif total_active_emails > 50:
-            suggested_action = "Consider archiving stale or less important threads to reduce clutter."
-
-        result = {
-            "load_score": load_score,
-            "unread_urgent_count": unread_urgent_count,
-            "flagged_threads_count": flagged_threads_count,
-            "average_response_delay_hours": round(avg_response_delay_hours, 2),
-            "total_active_conversations": total_active_emails,
-            "suggested_action": suggested_action
-        }
-        
-        return json.dumps(result, indent=2)
-
-    except Exception as e:
-        return f"Error calculating inbox load: {str(e)}"
 
 @mcp.tool()
 def reply_to_email_by_number(email_number: int, reply_text: str) -> str:
