@@ -194,8 +194,9 @@ class FakeNamespace:
             16: FakeFolder("Drafts"),
         }
         archive = FakeFolder("Archive")
-        self.Folders = [self.folders_by_index[6], archive]
-        self.folders_by_index[6].Folders = [archive]
+        attended = FakeFolder("Attended")
+        self.Folders = [self.folders_by_index[6], archive, attended]
+        self.folders_by_index[6].Folders = [archive, attended]
         self._by_id: Dict[str, FakeMail] = {m.EntryID: m for m in inbox}
         self.Categories = [
             _cat("Work", 1), _cat("Personal", 2),

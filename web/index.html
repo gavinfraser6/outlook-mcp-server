@@ -85,8 +85,14 @@
   .modal h2{margin:0 0 4px;font-size:18px}
   .modal .meta{color:var(--muted);font-size:13px;margin-bottom:12px}
   .msg{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:8px 0;background:var(--panel2)}
+  .msg.clickable{cursor:pointer}
+  .msg.clickable:hover{border-color:var(--accent)}
+  .msg.selected{border-color:var(--accent);box-shadow:0 0 0 1px rgba(59,130,246,.25) inset}
   .msg .h{display:flex;gap:8px;font-size:12px;color:var(--muted);margin-bottom:6px}
   .msg .body{white-space:pre-wrap;font-size:13px;max-height:280px;overflow:auto}
+  .emailDetail{border:1px solid var(--line);border-radius:10px;background:#111820;margin-top:12px;padding:12px}
+  .emailDetail h3{margin:0 0 4px;font-size:16px}
+  .emailBody{white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;margin:10px 0;max-height:420px;overflow:auto}
   .field{margin-bottom:10px}
   .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
   .field input{width:100%}
@@ -197,6 +203,7 @@ function toast(msg, kind){
   setTimeout(()=>t.remove(), 4200);
 }
 function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function jsArg(s){ return JSON.stringify(s || "").replace(/</g, "\\u003c"); }
 function setStatus(html){ document.getElementById("status").innerHTML = html || ""; }
 function loading(){ setStatus('<span class="spinner"></span> loading…'); }
 
@@ -336,7 +343,7 @@ function renderList(){
         <button onclick="openThread('${e.entry_id}')">Open conversation</button>
         <button onclick="replyTo('${e.entry_id}', false)">Reply</button>
         <button onclick="act('archive','${e.entry_id}',${i})">Archive latest</button>
-        <button onclick="markDone('${e.entry_id}',${i})">Done</button>
+        <button onclick="markDone('${e.entry_id}',${i})">Done: Attended</button>
         <button class="danger" onclick="act('trash','${e.entry_id}',${i})">Trash latest</button>
       </div>
     </div>`;
@@ -352,13 +359,28 @@ function removeCard(i){
 async function act(kind, entry_id, i){
   const path = kind==="archive" ? "/api/archive" : "/api/trash";
   const d = await post(path, {entry_id});
-  if(d.success){ toast((kind==="archive"?"Archived":"Moved to trash")+": "+(d.subject||""), "ok"); removeCard(i); loadUnread(); }
+  if(d.success){
+    toast((kind==="archive"?"Archived":"Moved to trash")+": "+(d.subject||""), "ok");
+    if(Number.isInteger(i) && i >= 0) removeCard(i);
+    loadUnread();
+  }
   else toast(d.message||"Failed", "err");
 }
 async function markDone(entry_id, i){
-  const d = await post("/api/mark", {entry_id, read:true});
-  if(d.success){ toast("Marked read", "ok"); removeCard(i); loadUnread(); }
-  else toast(d.message||"Failed","err");
+  const d = await post("/api/attend", {entry_id, days: Number(currentDays()) || 180});
+  if(d.success){
+    toast(`Moved ${d.affected_count||1} message(s) to ${d.destination||"Attended"}`, "ok");
+    if(Number.isInteger(i) && i >= 0) removeCard(i);
+    closeModal("readerOverlay");
+    loadUnread();
+  }
+  else toast((d.message||"Failed") + (d.details?(` - ${d.details}`):""), "err");
+}
+
+async function markOne(entry_id, read){
+  const d = await post("/api/mark", {entry_id, read});
+  if(d.success){ toast(read ? "Marked read" : "Marked unread", "ok"); loadUnread(); }
+  else toast(d.message||"Failed", "err");
 }
 
 async function openThread(entry_id){
@@ -381,21 +403,61 @@ async function openThread(entry_id){
       ${esc(follow.hint || current.insight_summary || "")}
     </div>
     ${questions}` : "";
-  const msgs = (d.messages||[]).map(x=>`
-    <div class="msg">
+  const msgs = (d.messages||[]).map((x, mi)=>{
+    const msgId = `msg-${mi}-${(x.entry_id||"").replace(/[^A-Za-z0-9_-]/g,"_")}`;
+    return `
+    <div class="msg clickable" id="${esc(msgId)}" onclick="openEmailDetail(${esc(jsArg(x.entry_id))}, ${esc(jsArg(entry_id))}, ${esc(jsArg(msgId))})" title="Open full email">
       <div class="h"><b>${esc(x.from||"")}</b><span class="grow"></span>${esc(x.date||"")}${x.has_attachments?" attachment":""}</div>
       <div class="body">${esc(x.snippet||"")}</div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
+  const threadArg = jsArg(entry_id);
+  const threadAttr = esc(threadArg);
   m.innerHTML = `
     <h2>${esc(d.subject||current.subject||"(no subject)")}</h2>
     <div class="meta">${(d.participants||current.participants||[]).map(esc).join(" | ")} - ${d.message_count} message(s)</div>
     ${insight}
     ${msgs || '<div class="muted">No messages found in this window.</div>'}
+    <div id="emailDetail" class="emailDetail" style="display:none"></div>
     <div class="modal-actions">
-      <button onclick="replyTo('${entry_id}', false); closeModal('readerOverlay')">Reply</button>
-      <button onclick="replyTo('${entry_id}', true); closeModal('readerOverlay')">Reply all</button>
-      <button onclick="forwardTo('${entry_id}'); closeModal('readerOverlay')">Forward</button>
+      <button onclick="replyTo(${threadAttr}, false); closeModal('readerOverlay')">Reply to latest</button>
+      <button onclick="replyTo(${threadAttr}, true); closeModal('readerOverlay')">Reply all</button>
+      <button onclick="markDone(${threadAttr}, ITEMS.findIndex(x=>x.entry_id===${threadAttr}))">Done: Attended</button>
+      <button onclick="forwardTo(${threadAttr}); closeModal('readerOverlay')">Forward latest</button>
       <button onclick="closeModal('readerOverlay')">Close</button>
+    </div>`;
+}
+
+async function openEmailDetail(entry_id, conversation_entry_id, row_id){
+  document.querySelectorAll(".msg.selected").forEach(el=>el.classList.remove("selected"));
+  const selected = document.getElementById(row_id);
+  if(selected) selected.classList.add("selected");
+  const box = document.getElementById("emailDetail");
+  box.style.display = "block";
+  box.innerHTML = '<div class="empty"><span class="spinner"></span> loading email...</div>';
+  const d = await get(`/api/email?entry_id=${encodeURIComponent(entry_id)}`);
+  if(!d.success){ box.innerHTML = `<div class="empty">Warning: ${esc(d.message||"error")}</div>`; return; }
+  const attachments = (d.attachments||[]).map(a=>chip(`${a.filename} (${Math.ceil((a.size_bytes||0)/1024)} KB)`, "att")).join("");
+  const labels = (d.labels||[]).map(l=>chip(l)).join("");
+  const meta = [d.sender, d.date, (d.recipients||[]).join("; ")].filter(Boolean).map(esc).join(" | ");
+  const idx = ITEMS.findIndex(x=>x.entry_id===conversation_entry_id);
+  const entryArg = jsArg(entry_id);
+  const convArg = jsArg(conversation_entry_id);
+  const entryAttr = esc(entryArg);
+  const convAttr = esc(convArg);
+  box.innerHTML = `
+    <h3>${esc(d.subject||"(no subject)")}</h3>
+    <div class="meta">${meta}</div>
+    <div class="chips">${d.unread?chip("unread", "unread"):""}${attachments}${labels}</div>
+    <div class="emailBody">${esc(d.body||"")}</div>
+    <div class="actions">
+      <button onclick="replyTo(${entryAttr}, false); closeModal('readerOverlay')">Reply</button>
+      <button onclick="replyTo(${entryAttr}, true); closeModal('readerOverlay')">Reply all</button>
+      <button onclick="forwardTo(${entryAttr}); closeModal('readerOverlay')">Forward</button>
+      <button onclick="markOne(${entryAttr}, ${!d.unread})">${d.unread?"Mark read":"Mark unread"}</button>
+      <button onclick="act('archive',${entryAttr},-1)">Archive email</button>
+      <button onclick="markDone(${convAttr}, ${idx})">Done: Attended</button>
+      <button class="danger" onclick="act('trash',${entryAttr},-1)">Trash email</button>
     </div>`;
 }
 

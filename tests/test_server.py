@@ -328,6 +328,41 @@ class TestOrganise:
         assert out["status"] == "archived"
         assert ns.GetItemFromID("B").moved_to.Name == "Archive"
 
+    def test_attend_conversation_moves_entire_thread(self, server):
+        from conftest import FakeMail
+
+        s, ns, outlook = server
+        now = datetime.datetime.now()
+        follow_on = FakeMail(
+            entry_id="A2", subject="Re: Invoice #42 due Friday",
+            sender_name="Acme Billing", sender_email="billing@acme.com",
+            body="Following up on the invoice.",
+            received=now - datetime.timedelta(minutes=10),
+            unread=True, conversation_id="C1",
+        )
+        sent_reply = FakeMail(
+            entry_id="S1", subject="Re: Invoice #42 due Friday",
+            sender_name="Me", sender_email="me@example.com",
+            body="I will confirm shortly.",
+            received=now - datetime.timedelta(minutes=5),
+            sent=now - datetime.timedelta(minutes=5),
+            unread=False, conversation_id="C1",
+        )
+        ns.GetDefaultFolder(H.OL_FOLDER_INBOX).Items.append(follow_on)
+        ns.GetDefaultFolder(H.OL_FOLDER_SENT).Items.append(sent_reply)
+        ns.register(follow_on)
+        ns.register(sent_reply)
+
+        out = _load(s.attend_conversation(entry_id="A", days=30))
+
+        assert out["status"] == "attended"
+        assert out["destination"] == "Attended"
+        assert out["affected_count"] == 3
+        for entry_id in ("A", "A2", "S1"):
+            item = ns.GetItemFromID(entry_id)
+            assert item.moved_to.Name == "Attended"
+            assert item.UnRead is False
+
     def test_mark_read_unread(self, server):
         s, ns, outlook = server
         _load(s.mark_as_read(entry_id="A"))

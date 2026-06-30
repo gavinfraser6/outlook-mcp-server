@@ -315,6 +315,15 @@ def create_app(call: CallFn) -> FastAPI:
             return _bad("entry_id")
         return await call(omcp.move_to_trash, entry_id=d["entry_id"])
 
+    @app.post("/api/attend")
+    async def attend(request: Request):
+        d = await request.json()
+        if not d.get("entry_id"):
+            return _bad("entry_id")
+        return await call(omcp.attend_conversation, entry_id=d["entry_id"],
+                          days=int(d.get("days", H.MAX_DAYS)),
+                          destination_folder_name=d.get("folder"))
+
     @app.post("/api/mark")
     async def mark(request: Request):
         d = await request.json()

@@ -38,6 +38,7 @@ class TestReadOnly:
         assert "Outlook Assistant" in r.text
         assert "Conversations" in r.text
         assert "Follow-up" in r.text
+        assert "Done: Attended" in r.text
 
     def test_favicon_204_has_no_body(self, client):
         # A 204 must carry no body — a JSON body here makes uvicorn raise
@@ -100,6 +101,15 @@ class TestActions:
         c, ns, outlook = client
         c.post("/api/mark", json={"entry_id": "A", "read": True})
         assert ns.GetItemFromID("A").UnRead is False
+
+    def test_attend_moves_conversation_to_attended(self, client):
+        c, ns, outlook = client
+        r = c.post("/api/attend", json={"entry_id": "A", "days": 30})
+        body = r.json()
+        assert body["success"] is True
+        assert body["status"] == "attended"
+        assert body["destination"] == "Attended"
+        assert ns.GetItemFromID("A").moved_to.Name == "Attended"
 
     def test_category(self, client):
         c, ns, outlook = client

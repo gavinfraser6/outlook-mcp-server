@@ -1485,6 +1485,112 @@ def move_email_by_number(destination_folder_name: str,
                         affected_count=1)
 
 
+def _conversation_mail_items(namespace, anchor, days: int = H.MAX_DAYS) -> List[Any]:
+    """Return live Outlook items in the same conversation from Inbox + Sent."""
+    conv_id = H._safe_getattr(anchor, "ConversationID")
+    if not conv_id:
+        return [anchor]
+
+    threshold = datetime.datetime.now() - datetime.timedelta(days=days)
+    collected: Dict[str, Any] = {}
+    for folder_idx, sort_field in ((H.OL_FOLDER_INBOX, "ReceivedTime"),
+                                   (H.OL_FOLDER_SENT, "SentOn")):
+        try:
+            folder = namespace.GetDefaultFolder(folder_idx)
+            items = folder.Items
+            try:
+                items.Sort(f"[{sort_field}]", True)
+            except Exception:
+                pass
+            scanned = 0
+            for item in list(items):
+                scanned += 1
+                if scanned > MAX_SCAN:
+                    break
+                try:
+                    dt = (H._safe_getattr(item, sort_field)
+                          or H._safe_getattr(item, "ReceivedTime")
+                          or H._safe_getattr(item, "SentOn"))
+                    if dt is not None and dt.replace(tzinfo=None) < threshold:
+                        break
+                    if H._safe_getattr(item, "ConversationID") != conv_id:
+                        continue
+                    item_id = H._safe_getattr(item, "EntryID") or f"{folder_idx}:{scanned}"
+                    collected[item_id] = item
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return list(collected.values()) or [anchor]
+
+
+def _clear_cache_entries(entry_ids: List[str]) -> None:
+    entry_id_set = set(entry_ids)
+    for number, record in list(_email_cache.items()):
+        if record.get("id") in entry_id_set:
+            del _email_cache[number]
+
+
+@mcp.tool()
+@email_tool
+def attend_conversation(entry_id: str, days: int = H.MAX_DAYS,
+                        destination_folder_name: Optional[str] = None) -> str:
+    """[MOVES EMAILS] Move every found message in a conversation to Attended.
+
+    The destination defaults to the ``OUTLOOK_ATTENDED_FOLDER`` environment
+    variable, or ``Attended``. Matching messages are gathered from Inbox and
+    Sent Items within the supplied window, marked read, then moved together.
+    """
+    if not entry_id:
+        raise OutlookError(ErrorCode.INVALID_PARAMETER, "entry_id is required.")
+    _validate_days(days, H.MAX_DAYS)
+    destination = destination_folder_name or os.environ.get("OUTLOOK_ATTENDED_FOLDER", "Attended")
+    namespace = _namespace()
+    anchor = _resolve_mail(namespace, entry_id=entry_id)
+    folder = _get_folder_by_name(namespace, destination)
+    if not folder:
+        raise OutlookError(
+            ErrorCode.FOLDER_NOT_FOUND,
+            f"Attended folder '{destination}' was not found.",
+            details="Create an Outlook folder named 'Attended' or set OUTLOOK_ATTENDED_FOLDER.",
+        )
+
+    items = _conversation_mail_items(namespace, anchor, days)
+    moved_ids: List[str] = []
+    subjects: List[str] = []
+    for item in items:
+        try:
+            item_id = H._safe_getattr(item, "EntryID")
+            subject = H._safe_getattr(item, "Subject")
+            try:
+                item.UnRead = False
+                item.Save()
+            except Exception:
+                pass
+            item.Move(folder)
+            if item_id:
+                moved_ids.append(item_id)
+            if subject and subject not in subjects:
+                subjects.append(subject)
+        except Exception as exc:
+            log.debug("Could not move conversation item to Attended: %s", exc)
+            continue
+
+    if not moved_ids:
+        raise OutlookError(ErrorCode.ACTION_FAILED,
+                           "No messages in the conversation could be moved.",
+                           retryable=True)
+    _clear_cache_entries(moved_ids)
+    return make_success(
+        action="attend_conversation",
+        status="attended",
+        destination=destination,
+        affected_count=len(moved_ids),
+        moved_entry_ids=moved_ids,
+        subject=subjects[0] if subjects else H._safe_getattr(anchor, "Subject"),
+    )
+
+
 @mcp.tool()
 @email_tool
 def archive_email(email_number: Optional[int] = None,
