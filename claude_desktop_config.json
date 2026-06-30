@@ -2,8 +2,12 @@
   "mcpServers": {
     "outlook": {
       "command": "python",
-      "args": ["d:\\Cline\\MCP\\outlook_mcp_server.py"],
-      "env": {}
+      "args": ["C:\\path\\to\\outlook-mcp-server\\outlook_mcp_server.py"],
+      "env": {
+        "OUTLOOK_MCP_DEBUG": "false",
+        "OUTLOOK_ARCHIVE_FOLDER": "Archive",
+        "OUTLOOK_MAX_ATTACHMENT_MB": "25"
+      }
     }
   }
 }

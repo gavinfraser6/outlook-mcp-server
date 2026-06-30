@@ -1,0 +1,5 @@
+# Development / test dependencies.
+# The test-suite uses fakes and does NOT require Windows, Outlook or pywin32,
+# so it runs on any platform / CI.
+-r requirements.txt
+pytest>=8.0
