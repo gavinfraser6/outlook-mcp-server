@@ -1,15 +1,27 @@
 # Outlook MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an
-AI agent (Codex, Claude, etc.) operate a **local Microsoft Outlook desktop
-profile** like a careful human email assistant: search, read, summarise, draft,
-reply, forward, organise, and manage tasks — with safety rails around anything
-that sends or deletes.
+Operate a **local Microsoft Outlook desktop profile** like a careful human email
+assistant — search, read, summarise, draft, reply, forward, organise, triage,
+and manage tasks — with safety rails around anything that sends or deletes.
 
 It talks to the Outlook application installed on a Windows machine via COM
 automation (`pywin32`). It does **not** use Gmail/IMAP/Graph, OAuth tokens, or
 stored passwords — it drives the Outlook session the signed-in Windows user has
 already authenticated. See [Authentication & Security](#authentication--security).
+
+### Three ways to use it
+
+| Surface | Command | For |
+| --- | --- | --- |
+| **MCP server** | `python outlook_mcp_server.py` | AI agents ([Model Context Protocol](https://modelcontextprotocol.io)) — Codex, Claude, etc. |
+| **Web dashboard** | `python outlook_web.py` → http://127.0.0.1:8765 | A human, in the browser. Triage-first, keyboard-driven. |
+| **Scheduled digest** | `python outlook_schedule.py` | Windows Task Scheduler — a daily "what needs attention" digest. |
+
+All three share one engine, one safety model, and one deterministic triage
+ranker, so behaviour is identical everywhere. Built for **busy mailboxes** (this
+was validated against an inbox with 100+ unread): a persistent warm Outlook
+connection, server-side filtering, early-stop scans, and explainable ranking so
+you can actually *get mail done*.
 
 ---
 
@@ -20,6 +32,9 @@ already authenticated. See [Authentication & Security](#authentication--security
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Web dashboard](#web-dashboard)
+- [Scheduled digest](#scheduled-digest)
+- [Busy-mailbox optimisations](#busy-mailbox-optimisations)
 - [Environment variables](#environment-variables)
 - [Tool reference](#tool-reference)
 - [Response format](#response-format)
@@ -46,8 +61,10 @@ already authenticated. See [Authentication & Security](#authentication--security
   and apply/remove Outlook **categories** (the closest thing to labels).
 - **Attachments**: list metadata, save to disk (size-limited, never executed),
   and read safe text attachments inline.
-- **Productivity**: inbox triage data, a morning-briefing aggregator, inbox-load
-  metrics, and Outlook **tasks** (create / list / complete).
+- **Triage**: a deterministic, explainable "what needs attention first" ranking
+  (`triage_inbox`) shared by the agent, the web dashboard and the digest.
+- **Productivity**: a morning-briefing aggregator, inbox-load metrics, and
+  Outlook **tasks** (create / list / complete).
 
 All responses are **structured JSON** designed for an LLM to consume.
 
@@ -126,6 +143,98 @@ Use an **absolute path** to `outlook_mcp_server.py`. The `env` block is optional
 
 ---
 
+## Web dashboard
+
+A localhost, triage-first UI for getting through mail quickly — no agent needed.
+
+```bash
+python outlook_web.py            # serves http://127.0.0.1:8765
+# or double-click run_web.bat on Windows
+```
+
+Then open **http://127.0.0.1:8765**. It does **not** require the MCP server to be
+running — it talks to Outlook directly via a single warm connection.
+
+**What you can do**
+- **Needs attention** tab: your inbox ranked by a deterministic scorer (most
+  urgent first) with explainable reason chips (unread, from manager, urgent
+  language, mentions invoice/deadline, contains a question, …; newsletters and
+  no-reply mail are pushed down).
+- One-click **Archive / Done (mark read) / Trash / Reply** on every card.
+- **Open** a card to read the whole thread.
+- **Search** tab: keyword search across the mailbox.
+- **Drafts** tab: review and send saved drafts.
+- **Compose / reply / forward**: always creates a draft first; **Send** asks for
+  a confirmation before anything leaves your outbox.
+
+**Keyboard shortcuts** (when not typing): `j`/`k` move, `o`/`Enter` open,
+`r` reply, `e` archive, `u` mark done, `#` trash, `c` compose, `/` search,
+`g` refresh, `Esc` close.
+
+**Security**
+- Binds to **127.0.0.1** only by default. Don't bind to `0.0.0.0` unless you also
+  set a token.
+- Optional shared token: set `OUTLOOK_WEB_TOKEN`. Then open the UI with
+  `http://127.0.0.1:8765/?token=YOUR_TOKEN` (the page forwards it on every API
+  call; `/api/health` stays open).
+- Sending still obeys the confirmation guard — the UI cannot send silently.
+
+---
+
+## Scheduled digest
+
+`outlook_schedule.py` produces a deterministic "what needs my attention" digest
+on a schedule. It is **read-only by default** (scans, ranks, writes files) and
+prints a short summary.
+
+```bash
+python outlook_schedule.py                 # write digest + print summary
+python outlook_schedule.py --days 3 --top 20
+python outlook_schedule.py --auto-categorize          # opt-in: tags top unread
+python outlook_schedule.py --email-to you@corp.com    # opt-in: emails the digest
+```
+
+It writes `digest.json` and `digest.html` to the state dir (`OUTLOOK_STATE_DIR`,
+default `%LOCALAPPDATA%\outlook-mcp\`). The web dashboard exposes the latest one
+at `/api/digest`.
+
+**Optional, explicit side-effects** (off unless you pass the flag):
+- `--auto-categorize` applies a category (default `⚑ Needs Reply`, capped at
+  `--max-categorize`, only to unread inbound at/above `--min-score`) so flagged
+  mail stands out inside Outlook.
+- `--email-to ADDRESS` emails the HTML digest to yourself — an explicit send you
+  opt into by passing the flag.
+
+**Windows Task Scheduler setup**
+1. Task Scheduler → *Create Basic Task* → set your trigger (e.g. daily 07:30).
+2. Action: *Start a program*.
+   - Program/script: `python` (or the full path to `python.exe`)
+   - Add arguments: `outlook_schedule.py --days 2 --top 15`
+   - Start in: the repo folder (or just point at `run_schedule.bat`).
+3. Outlook must be running/signed in when the task fires.
+
+A non-zero exit code is returned on failure so the scheduler can report it.
+
+---
+
+## Busy-mailbox optimisations
+
+Tuned for inboxes with thousands of items and hundreds unread:
+
+- **Warm connection.** The web UI funnels all Outlook access through one
+  dedicated COM (STA) worker thread that connects once and stays connected — no
+  per-request `Dispatch`, no cross-thread COM races.
+- **Server-side narrowing.** Folder scans push a date floor (plus unread/subject
+  where safe) into Outlook's `Restrict`, so the whole folder is never walked in
+  Python. The authoritative match still runs in Python, so results stay correct.
+- **Early-stop + caps.** Scans stop once enough matches for the page are found;
+  results report `capped: true` when a cap is hit, so totals are an honest lower
+  bound instead of a slow exact count.
+- **Deterministic triage.** Ranking is a transparent rule set (no LLM latency),
+  shared by the agent tool, the dashboard and the digest.
+
+---
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -134,6 +243,10 @@ Use an **absolute path** to `outlook_mcp_server.py`. The `env` block is optional
 | `OUTLOOK_ARCHIVE_FOLDER` | `Archive` | Folder name `archive_email` moves messages to. |
 | `OUTLOOK_ATTACHMENT_DIR` | system temp dir | Where `save_attachment` writes files. |
 | `OUTLOOK_MAX_ATTACHMENT_MB` | `25` | Max size (MB) for reading/saving an attachment. |
+| `OUTLOOK_WEB_HOST` | `127.0.0.1` | Web dashboard bind host. Keep on localhost. |
+| `OUTLOOK_WEB_PORT` | `8765` | Web dashboard port. |
+| `OUTLOOK_WEB_TOKEN` | _(unset)_ | If set, the web API requires this token (header `X-Outlook-Token` or `?token=`). |
+| `OUTLOOK_STATE_DIR` | `%LOCALAPPDATA%\outlook-mcp` | Where the scheduled digest is written. |
 
 ---
 
@@ -195,7 +308,8 @@ stable **`entry_id`** (returned on every result, survives across listings).
 ### Productivity & tasks
 | Tool | Tag | Summary |
 | --- | --- | --- |
-| `prioritize_inbox` | READ-ONLY | Recent inbox data for the agent to triage. |
+| `triage_inbox` | READ-ONLY | **Ranked** "what needs attention first" with scores + reasons (deterministic). |
+| `prioritize_inbox` | READ-ONLY | Raw recent inbox data for the agent to rank itself. |
 | `generate_morning_briefing` | READ-ONLY | Calendar + tasks + active threads. |
 | `inbox_load_estimator` | READ-ONLY | Inbox-load metrics to interpret. |
 | `create_outlook_task` | writes task | Create an Outlook To-Do task. |
@@ -354,16 +468,26 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-What's covered: recipient validation, search predicates & pagination, response
-envelopes, body cleaning / quote trimming, the email formatter (with fake mail
-items), draft-vs-send safety, confirmation guards, archive/trash/read-state,
-labels, attachments, and the "Outlook not available" path.
+What's covered (100+ tests): recipient validation, search predicates &
+pagination, response envelopes, body cleaning / quote trimming, the email
+formatter, draft-vs-send safety, confirmation guards, archive/trash/read-state,
+labels, attachments, the deterministic **triage scorer**, the **web API**
+(FastAPI `TestClient` over fakes, incl. token auth + send-confirm), and the
+**scheduled digest** builder.
+
+```bash
+python -m pytest -q          # all surfaces, no Outlook needed
+python outlook_web.py        # try the dashboard locally (needs Outlook)
+```
 
 Project layout:
 
 ```
 outlook_mcp_server.py   # FastMCP server + COM glue + tool definitions
-outlook_helpers.py      # pure, COM-free, unit-tested helpers
+outlook_helpers.py      # pure, COM-free, unit-tested helpers (incl. triage scorer)
+outlook_web.py          # localhost FastAPI dashboard + persistent COM worker
+web/index.html          # single-page front-end (vanilla JS, no build step)
+outlook_schedule.py     # Task Scheduler entry point → digest.json/.html
 tests/                  # pytest suite (fakes in conftest.py)
 ```
 

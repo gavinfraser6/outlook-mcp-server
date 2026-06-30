@@ -63,6 +63,44 @@ SAFE_TEXT_EXTENSIONS = {
 }
 DEFAULT_MAX_ATTACHMENT_MB = 25
 
+# Keywords used by the deterministic triage scorer (English + Afrikaans).
+URGENT_KEYWORDS = (
+    "urgent", "asap", "immediately", "action required", "action needed",
+    "critical", "important", "overdue", "final notice", "time sensitive",
+    "deadline", "expires", "today", "eod", "cob",
+    # Afrikaans
+    "dringend", "spoedig", "krities", "belangrik", "sperdatum", "vandag",
+    "aksie vereis", "aksie benodig", "verval",
+)
+MONEY_KEYWORDS = (
+    "invoice", "payment", "pay ", "paid", "remittance", "statement",
+    "overdue", "outstanding", "quote", "quotation", "po ", "purchase order",
+    "eft", "balance due", "amount due", "refund", "billing",
+    # Afrikaans
+    "faktuur", "betaling", "betaal", "uitstaande", "kwotasie", "rekening",
+)
+MEETING_KEYWORDS = (
+    "meeting", "calendar", "invite", "appointment", "call ", "zoom", "teams",
+    "reschedule", "availability", "agenda", "rsvp",
+    # Afrikaans
+    "vergadering", "afspraak", "uitnodiging",
+)
+DEADLINE_KEYWORDS = (
+    "deadline", "due ", "by friday", "by monday", "by tomorrow", "by eod",
+    "before ", "no later than", "submit by", "respond by", "reply by",
+    "sperdatum", "voor ",
+)
+APPROVAL_KEYWORDS = (
+    "approve", "approval", "sign off", "sign-off", "authorise", "authorize",
+    "confirm", "review and", "please review", "your approval", "goedkeuring",
+)
+# Senders/markers that suggest automated / bulk mail (de-prioritised).
+AUTOMATED_MARKERS = (
+    "no-reply", "noreply", "no_reply", "donotreply", "do-not-reply",
+    "notifications@", "newsletter", "mailer", "bounce", "automated",
+    "unsubscribe", "marketing@", "updates@",
+)
+
 
 # ---------------------------------------------------------------------------
 # Error codes – stable identifiers an agent can branch on.
@@ -352,6 +390,158 @@ def email_matches(
             if term and term.lower() in haystack:
                 return False
     return True
+
+
+def _parse_received(value: Optional[str]) -> Optional["datetime.datetime"]:
+    import datetime as _dt
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return _dt.datetime.strptime(value, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _contains_any(haystack: str, needles: Iterable[str]) -> bool:
+    return any(n in haystack for n in needles)
+
+
+def triage_score(
+    email: Dict[str, Any],
+    *,
+    manager_name: Optional[str] = None,
+    my_email: Optional[str] = None,
+    now: Optional["datetime.datetime"] = None,
+) -> Tuple[int, List[str]]:
+    """Deterministically score how much an email needs attention.
+
+    Returns ``(score, reasons)`` where higher means more urgent. This is a
+    transparent, rule-based heuristic (no LLM) so the web dashboard, the
+    scheduled digest and agents all rank consistently and explainably. Operates
+    on a *formatted* email dict; ``reasons`` are short human-readable strings
+    suitable for UI badges.
+    """
+    import datetime as _dt
+    now = now or _dt.datetime.now()
+    score = 0
+    reasons: List[str] = []
+
+    subject = (email.get("subject") or "").lower()
+    body = (email.get("body") or email.get("snippet") or "").lower()
+    text = subject + "\n" + body
+    sender = (email.get("sender") or "").lower()
+    sender_email = (email.get("sender_email") or "").lower()
+
+    # Automated/bulk mail is rarely action-worthy – damp it early.
+    automated = _contains_any(sender_email + " " + sender + " " + body,
+                              AUTOMATED_MARKERS)
+    if automated:
+        score -= 3
+        reasons.append("looks automated/bulk")
+
+    if email.get("unread"):
+        score += 2
+        reasons.append("unread")
+    if email.get("importance") == "High":
+        score += 3
+        reasons.append("marked high importance")
+    if email.get("flagged") == "flagged":
+        score += 2
+        reasons.append("flagged")
+
+    if manager_name and manager_name.lower() in sender:
+        score += 4
+        reasons.append("from your manager")
+
+    if _contains_any(text, URGENT_KEYWORDS):
+        score += 3
+        reasons.append("urgent language")
+    if _contains_any(text, DEADLINE_KEYWORDS):
+        score += 2
+        reasons.append("mentions a deadline")
+    if _contains_any(text, MONEY_KEYWORDS):
+        score += 2
+        reasons.append("mentions invoice/payment")
+    if _contains_any(text, APPROVAL_KEYWORDS):
+        score += 2
+        reasons.append("asks for approval/sign-off")
+    if _contains_any(text, MEETING_KEYWORDS):
+        score += 1
+        reasons.append("mentions a meeting")
+    if "?" in body and not automated:
+        score += 1
+        reasons.append("contains a question")
+
+    received = _parse_received(email.get("received_time"))
+    if received:
+        age_hours = (now - received).total_seconds() / 3600
+        if age_hours <= 24:
+            score += 2
+            reasons.append("arrived in the last day")
+        elif age_hours <= 72:
+            score += 1
+            reasons.append("arrived in the last 3 days")
+        elif age_hours >= 24 * 14:
+            score -= 1  # stale
+
+    if email.get("has_attachments") and not automated:
+        score += 1
+        reasons.append("has attachments")
+
+    return max(score, 0), reasons
+
+
+def rank_for_triage(
+    emails: Iterable[Dict[str, Any]],
+    *,
+    manager_name: Optional[str] = None,
+    my_email: Optional[str] = None,
+    now: Optional["datetime.datetime"] = None,
+) -> List[Dict[str, Any]]:
+    """Attach triage score/reasons to each email and sort, most-urgent first."""
+    scored: List[Dict[str, Any]] = []
+    for e in emails:
+        score, reasons = triage_score(e, manager_name=manager_name,
+                                      my_email=my_email, now=now)
+        item = dict(e)
+        item["triage_score"] = score
+        item["triage_reasons"] = reasons
+        scored.append(item)
+    scored.sort(
+        key=lambda x: (x["triage_score"], x.get("received_time") or ""),
+        reverse=True,
+    )
+    return scored
+
+
+def escape_dasl_literal(value: str) -> str:
+    """Escape a value for inclusion in an Outlook DASL/Jet string literal."""
+    # Double single quotes; drop characters that would break the filter.
+    return (value or "").replace("'", "''").replace("%", "").replace('"', "")
+
+
+def build_inbox_restriction(
+    *,
+    threshold: Optional["datetime.datetime"] = None,
+    unread_only: bool = False,
+    subject: Optional[str] = None,
+) -> Optional[str]:
+    """Build a *safe* Outlook ``Restrict`` filter to narrow scans server-side.
+
+    Only pushes filters that cannot cause false negatives (date floor, unread,
+    subject contains). Sender/keyword/attachment filtering is left to the
+    authoritative Python predicate. Returns ``None`` if no clauses apply.
+    """
+    clauses: List[str] = []
+    if threshold is not None:
+        clauses.append(f"[ReceivedTime] >= '{threshold.strftime('%m/%d/%Y %I:%M %p')}'")
+    if unread_only:
+        clauses.append("[UnRead] = True")
+    if subject:
+        clauses.append(f"[Subject] Like '%{escape_dasl_literal(subject)}%'")
+    return " And ".join(clauses) if clauses else None
 
 
 def paginate(items: List[Any], offset: int, limit: int) -> Tuple[List[Any], Dict[str, Any]]:

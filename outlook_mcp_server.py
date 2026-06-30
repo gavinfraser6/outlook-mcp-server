@@ -266,8 +266,17 @@ def _from_field(email: Dict[str, Any]) -> str:
     return f"{name} <{addr}>".strip() if addr else name
 
 
-def _fetch_emails(folder, days: int) -> List[Dict[str, Any]]:
-    """Fetch + format emails newer than ``days`` from a folder, newest first."""
+def _fetch_emails(folder, days: int, *, unread_only: bool = False,
+                  subject: Optional[str] = None, include_body: bool = True,
+                  scan_cap: int = MAX_SCAN) -> Tuple[List[Dict[str, Any]], bool]:
+    """Fetch + format emails newer than ``days`` from a folder, newest first.
+
+    Optimised for busy mailboxes: pushes a date floor (and, when safe, an
+    unread/subject filter) to Outlook via ``Restrict`` so the whole folder is
+    never iterated in Python, and stops early once ``scan_cap`` items have been
+    collected. Returns ``(emails, capped)`` where ``capped`` indicates the scan
+    hit the cap (so totals are a lower bound).
+    """
     now = datetime.datetime.now()
     threshold = now - datetime.timedelta(days=days)
     items = folder.Items
@@ -276,31 +285,38 @@ def _fetch_emails(folder, days: int) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    # Date pre-filter via Restrict (fast path); fall back to manual filtering.
-    try:
-        start_str = threshold.strftime("%m/%d/%Y %H:%M %p")
-        items = items.Restrict(f"[ReceivedTime] >= '{start_str}'")
-    except Exception:
-        pass
+    # Push safe filters to Outlook (huge win on large folders). Falls back to
+    # an unrestricted scan if the provider rejects the filter.
+    restriction = H.build_inbox_restriction(
+        threshold=threshold, unread_only=unread_only, subject=subject)
+    if restriction:
+        try:
+            items = items.Restrict(restriction)
+        except Exception as exc:
+            log.debug("Restrict failed (%s); scanning unfiltered.", exc)
 
     out: List[Dict[str, Any]] = []
+    capped = False
     scanned = 0
     for item in items:
         scanned += 1
+        if len(out) >= scan_cap:
+            capped = True
+            log.info("Scan cap (%d) reached in folder fetch.", scan_cap)
+            break
         if scanned > MAX_SCAN:
-            log.info("Scan ceiling (%d) reached in folder fetch.", MAX_SCAN)
+            capped = True
             break
         try:
             received = H._safe_getattr(item, "ReceivedTime")
-            if received is not None:
-                if received.replace(tzinfo=None) < threshold:
-                    # Sorted newest-first: once we cross the threshold, stop.
-                    break
-            out.append(H.format_email_item(item, include_body=True))
+            if received is not None and received.replace(tzinfo=None) < threshold:
+                # Sorted newest-first: once we cross the floor, stop.
+                break
+            out.append(H.format_email_item(item, include_body=include_body))
         except Exception as exc:
             log.debug("Skipping unreadable item: %s", exc)
             continue
-    return out
+    return out, capped
 
 
 def _validate_days(days: int, maximum: int = H.MAX_DAYS) -> None:
@@ -410,7 +426,11 @@ def search_emails(
     folder, folder_disp = _require_folder(namespace, folder_name)
 
     exclude_terms = [t.strip() for t in (exclude or "").split(",") if t.strip()]
-    emails = _fetch_emails(folder, days)
+    # Push the date floor + unread + subject narrowing to Outlook; keep the
+    # Python predicate authoritative for the rest.
+    emails, capped = _fetch_emails(
+        folder, days, unread_only=unread_only, subject=subject,
+        scan_cap=H.MAX_PAGE_SIZE * 8)
     matched = [
         e for e in emails
         if H.email_matches(
@@ -422,6 +442,7 @@ def search_emails(
     ]
     _cache_listing(matched)
     page, page_info = H.paginate(matched, offset, max_results)
+    page_info["capped"] = capped
 
     return make_success(
         action="search_emails",
@@ -459,11 +480,11 @@ def list_recent_emails(days: int = 7, folder_name: Optional[str] = None,
     _validate_days(days)
     namespace = _namespace()
     folder, folder_disp = _require_folder(namespace, folder_name)
-    emails = _fetch_emails(folder, days)
-    if unread_only:
-        emails = [e for e in emails if e.get("unread")]
+    emails, capped = _fetch_emails(folder, days, unread_only=unread_only,
+                                   scan_cap=H.MAX_PAGE_SIZE * 8)
     _cache_listing(emails)
     page, page_info = H.paginate(emails, offset, max_results)
+    page_info["capped"] = capped
     return make_success(
         action="list_recent_emails",
         folder=folder_disp, days=days, unread_only=unread_only,
@@ -1270,7 +1291,8 @@ def prioritize_inbox(days: int = 1, max_emails_to_scan: int = 25) -> str:
     namespace = _namespace()
     manager = _get_manager_name(namespace)
     inbox = namespace.GetDefaultFolder(H.OL_FOLDER_INBOX)
-    emails = _fetch_emails(inbox, days)[:max_emails_to_scan]
+    emails, _capped = _fetch_emails(inbox, days, scan_cap=max_emails_to_scan)
+    emails = emails[:max_emails_to_scan]
     _cache_listing(emails)
     out = []
     for e in emails:
@@ -1287,6 +1309,53 @@ def prioritize_inbox(days: int = 1, max_emails_to_scan: int = 25) -> str:
         })
     return make_success(action="prioritize_inbox", count=len(out), emails=out,
                         analysis_instructions="Rank these by urgency/importance and explain why.")
+
+
+@mcp.tool()
+@email_tool
+def triage_inbox(days: int = 3, max_results: int = 20,
+                 folder_name: Optional[str] = None,
+                 unread_only: bool = False) -> str:
+    """[READ-ONLY] Rank what needs attention using a deterministic scorer.
+
+    Unlike prioritize_inbox (which hands raw data to the agent), this returns a
+    ready-made, explainable ranking — most-urgent first — using transparent
+    rules (unread, sender importance, urgent/deadline/money/approval language,
+    questions, recency; automated/bulk mail is down-ranked). Ideal for
+    "what should I deal with first?" and powers the dashboard + scheduled digest.
+
+    Args:
+        days: Look-back window (1–60, default 3).
+        max_results: How many ranked emails to return (1–100, default 20).
+        folder_name: Folder to triage (default Inbox).
+        unread_only: Only consider unread mail when true.
+
+    Each result includes triage_score and triage_reasons plus the usual summary
+    fields (entry_id, subject, from, date, snippet, labels, …).
+    """
+    _validate_days(days, H.ACTIONABLE_EMAIL_MAX_DAYS)
+    namespace = _namespace()
+    manager = _get_manager_name(namespace)
+    my_email = _get_my_email(namespace)
+    folder, folder_disp = _require_folder(namespace, folder_name)
+    emails, capped = _fetch_emails(folder, days, unread_only=unread_only,
+                                   scan_cap=H.MAX_PAGE_SIZE * 8)
+    ranked = H.rank_for_triage(emails, manager_name=manager, my_email=my_email)
+    _cache_listing(ranked)
+    page = ranked[:max(1, min(max_results, H.MAX_PAGE_SIZE))]
+    results = []
+    for e in page:
+        summary = _summarize(e)
+        summary["triage_score"] = e.get("triage_score")
+        summary["triage_reasons"] = e.get("triage_reasons")
+        results.append(summary)
+    return make_success(
+        action="triage_inbox", folder=folder_disp, days=days,
+        scanned=len(emails), capped=capped, count=len(results),
+        results=results,
+        next_safe_action="Open the top item with get_email_by_number, then draft a "
+                         "reply or archive it. Sending always needs confirmation.",
+    )
 
 
 @mcp.tool()

@@ -1,3 +1,8 @@
 # Runtime dependencies for the Outlook MCP server.
 mcp>=1.2.0
 pywin32>=305 ; sys_platform == "win32"
+
+# Web dashboard (outlook_web.py). These usually arrive transitively with `mcp`,
+# but are listed explicitly so the localhost UI works on a clean install.
+fastapi>=0.110
+uvicorn>=0.27
