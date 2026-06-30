@@ -38,6 +38,21 @@
   .tab.active{color:var(--text);background:var(--panel2);border-color:var(--line)}
   main{max-width:920px;margin:0 auto;padding:16px}
   .toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  .insightBar{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:8px;margin:0 0 12px}
+  .metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 10px;min-height:58px}
+  .metric b{display:block;font-size:18px;line-height:1.1;color:var(--text)}
+  .metric span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-top:3px}
+  .convMeta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin:4px 0 8px}
+  .insight{color:#c8d2dc;font-size:13px;margin:6px 0 8px}
+  .suggest{border-left:3px solid var(--accent);padding:7px 9px;background:rgba(59,130,246,.10);border-radius:6px;margin:8px 0;color:#dbeafe}
+  .follow{border-color:#3f4a56;color:#cbd5e1}
+  .follow.reply_owed{border-color:var(--red);color:#ffb3af;background:#351d20}
+  .follow.waiting_on_them{border-color:var(--amber);color:#ffe2a3;background:#332916}
+  .follow.last_from_you{border-color:#6b7280;color:#d1d5db;background:#242932}
+  .question{color:#d8dee9;background:#1f2933;border:1px solid var(--line);border-radius:8px;padding:7px 9px;margin:7px 0;font-size:12px}
+  .threadline{display:grid;grid-template-columns:90px 1fr auto;gap:8px;align-items:start;border-top:1px solid var(--line);padding:7px 0;font-size:12px;color:var(--muted)}
+  .threadline b{color:var(--text);font-weight:600}
+  @media (max-width:760px){.insightBar{grid-template-columns:repeat(2,minmax(0,1fr))}.threadline{grid-template-columns:1fr}.card .row1{align-items:flex-start}.card .date{white-space:normal}}
   .search{flex:1;min-width:200px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
     padding:12px 14px;margin-bottom:10px;transition:border-color .1s}
@@ -94,7 +109,7 @@
 <header>
   <h1>📧 Outlook Assistant</h1>
   <div class="tabs">
-    <div class="tab active" data-view="triage" onclick="switchView('triage')">Needs attention</div>
+    <div class="tab active" data-view="triage" onclick="switchView('triage')">Conversations</div>
     <div class="tab" data-view="search" onclick="switchView('search')">Search</div>
     <div class="tab" data-view="drafts" onclick="switchView('drafts')">Drafts</div>
   </div>
@@ -106,16 +121,22 @@
 
 <main>
   <div class="toolbar" id="triageBar">
-    <input class="search" type="text" id="searchBox" placeholder="Search mail and press Enter…  ( / to focus )" />
+    <input class="search" type="text" id="searchBox" placeholder="Search conversations" />
     <select id="daysSel" onchange="refresh()">
-      <option value="1">Today</option>
-      <option value="3" selected>3 days</option>
-      <option value="7">7 days</option>
       <option value="14">14 days</option>
       <option value="30">30 days</option>
+      <option value="60">60 days</option>
+      <option value="90">90 days</option>
+      <option value="180" selected>180 days</option>
+    </select>
+    <select id="followDays" onchange="refresh()">
+      <option value="1">Follow-up 1d</option>
+      <option value="3" selected>Follow-up 3d</option>
+      <option value="7">Follow-up 7d</option>
     </select>
     <label class="muted"><input type="checkbox" id="unreadOnly" onchange="refresh()"/> Unread only</label>
   </div>
+  <div id="insightBar" class="insightBar"></div>
   <div id="list"></div>
   <div id="status" class="muted" style="text-align:center;padding:12px"></div>
 </main>
@@ -183,6 +204,7 @@ function switchView(v){
   VIEW = v;
   document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active", t.dataset.view===v));
   document.getElementById("triageBar").style.display = (v==="drafts") ? "none" : "flex";
+  document.getElementById("insightBar").style.display = (v==="drafts") ? "none" : "grid";
   refresh();
 }
 
@@ -198,28 +220,63 @@ async function loadUnread(){
   document.getElementById("unreadCount").textContent = d.success ? d.unread_count : "?";
 }
 
+function currentDays(){ return document.getElementById("daysSel").value; }
+function currentFollowDays(){ return document.getElementById("followDays").value; }
+
+function insightQuery(extra){
+  const p = new URLSearchParams({
+    days: currentDays(),
+    limit: "60",
+    unread_only: document.getElementById("unreadOnly").checked,
+    follow_up_days: currentFollowDays()
+  });
+  Object.entries(extra||{}).forEach(([k,v])=>{
+    if(v!==undefined && v!==null && `${v}`.trim()!=="") p.set(k, v);
+  });
+  return `/api/insights?${p.toString()}`;
+}
+
+function setInsightSummary(s){
+  const bar = document.getElementById("insightBar");
+  if(!s){ bar.innerHTML = ""; return; }
+  const theme = (s.top_themes||[]).slice(0,2).map(x=>`${esc(x.theme)} (${x.count})`).join(", ") || "none";
+  bar.innerHTML = `
+    <div class="metric"><b>${s.total_conversations||0}</b><span>conversations</span></div>
+    <div class="metric"><b>${s.reply_owed||0}</b><span>reply owed</span></div>
+    <div class="metric"><b>${s.waiting_on_them||0}</b><span>waiting on them</span></div>
+    <div class="metric"><b>${s.unread_conversations||0}</b><span>unread threads</span></div>
+    <div class="metric"><b>${esc(theme)}</b><span>top themes</span></div>`;
+}
+
+function insightStatus(d){
+  const total = d.page_info ? d.page_info.total_matched : (d.count||0);
+  const shown = ITEMS.length;
+  const cap = d.capped ? " scan capped" : "";
+  return `${shown} of ${total} conversation(s) shown; scanned ${d.scanned||0} message(s) over ${d.days} days.${cap}`;
+}
+
 async function loadTriage(){
-  const days = document.getElementById("daysSel").value;
-  const unread = document.getElementById("unreadOnly").checked;
-  const d = await get(`/api/triage?days=${days}&limit=40&unread_only=${unread}`);
-  if(!d.success){ setStatus("⚠️ "+esc(d.message||"error")); ITEMS=[]; renderList(); return; }
-  ITEMS = d.results || [];
+  const d = await get(insightQuery());
+  if(!d.success){ setInsightSummary(null); setStatus("Warning: "+esc(d.message||"error")); ITEMS=[]; renderList(); return; }
+  ITEMS = d.conversations || [];
+  setInsightSummary(d.mailbox_insights);
   renderList();
-  setStatus(ITEMS.length ? `${ITEMS.length} ranked • scanned ${d.scanned}${d.capped?"+":""}` : "");
+  setStatus(ITEMS.length ? insightStatus(d) : "No conversations matched this view.");
 }
 
 async function loadSearch(){
   const q = document.getElementById("searchBox").value.trim();
-  const days = document.getElementById("daysSel").value;
-  if(!q){ ITEMS=[]; renderList(); setStatus("Type a search and press Enter."); return; }
-  const d = await get(`/api/search?keyword=${encodeURIComponent(q)}&days=${days}&max_results=50`);
-  if(!d.success){ setStatus("⚠️ "+esc(d.message||"error")); return; }
-  ITEMS = d.results || [];
+  if(!q){ ITEMS=[]; setInsightSummary(null); renderList(); setStatus("Type a search to find matching conversations."); return; }
+  const d = await get(insightQuery({keyword:q}));
+  if(!d.success){ setInsightSummary(null); setStatus("Warning: "+esc(d.message||"error")); return; }
+  ITEMS = d.conversations || [];
+  setInsightSummary(d.mailbox_insights);
   renderList();
-  setStatus(`${d.page_info.total_matched} match(es)${d.page_info.capped?" (capped)":""}`);
+  setStatus(insightStatus(d));
 }
 
 async function loadDrafts(){
+  setInsightSummary(null);
   const d = await get("/api/drafts");
   if(!d.success){ setStatus("⚠️ "+esc(d.message||"error")); return; }
   const list = document.getElementById("list");
@@ -236,32 +293,51 @@ async function loadDrafts(){
   setStatus(`${d.drafts.length} draft(s)`);
 }
 
-function scoreClass(s){ return s>=10?"hi":(s>=5?"mid":""); }
+function scoreClass(s){ return s>=14?"hi":(s>=7?"mid":""); }
+function chip(text, cls){ return text ? `<span class="chip ${cls||""}">${esc(text)}</span>` : ""; }
+function followChip(f){
+  if(!f || !f.state || f.state==="none") return "";
+  const due = f.due ? " due" : "";
+  return `<span class="chip follow ${esc(f.state)}">${esc(f.label||f.state)}${due}</span>`;
+}
+function conversationDate(e){ return e.latest_date || e.date || ""; }
+function conversationFrom(e){ return e.latest_from || e.from || ""; }
+function conversationSnippet(e){ return e.insight_summary || e.latest_snippet || e.snippet || ""; }
+function conversationScore(e){ return e.attention_score!=null ? e.attention_score : e.triage_score; }
 
 function renderList(){
   const list = document.getElementById("list");
-  if(!ITEMS.length){ list.innerHTML = '<div class="empty">Nothing here. 🎉</div>'; return; }
+  if(!ITEMS.length){ list.innerHTML = '<div class="empty">Nothing here.</div>'; return; }
   list.innerHTML = ITEMS.map((e,i)=>{
-    const reasons = (e.triage_reasons||[]).slice(0,4).map(r=>`<span class="chip">${esc(r)}</span>`).join("");
-    const unreadChip = e.unread ? '<span class="chip unread">unread</span>' : "";
-    const attChip = e.has_attachments ? `<span class="chip att">${e.attachment_count}</span>` : "";
-    const labels = (e.labels||[]).map(l=>`<span class="chip">${esc(l)}</span>`).join("");
-    const scoreBadge = (e.triage_score!=null) ? `<span class="score ${scoreClass(e.triage_score)}">${e.triage_score}</span>` : "";
-    return `<div class="card ${i===SEL?'sel':''}" data-i="${i}" id="card${i}">
+    const score = conversationScore(e);
+    const scoreBadge = (score!=null) ? `<span class="score ${scoreClass(score)}">${score}</span>` : "";
+    const reasons = (e.triage_reasons||[]).slice(0,4).map(r=>chip(r)).join("");
+    const themes = (e.themes||[]).slice(0,5).map(t=>chip(t)).join("");
+    const unreadChip = (e.unread_count>0) ? chip(`${e.unread_count} unread`, "unread") : (e.unread ? chip("unread", "unread") : "");
+    const attCount = e.attachment_count || (e.has_attachments ? e.attachment_count : 0);
+    const attChip = attCount ? `<span class="chip att">${attCount}</span>` : "";
+    const labels = (e.labels||[]).map(l=>chip(l)).join("");
+    const question = (e.open_questions||[])[0];
+    const questionHtml = question ? `<div class="question"><b>${esc(question.from||"Question")}</b>: ${esc(question.question||"")}</div>` : "";
+    const meta = e.message_count ? `${e.message_count} messages; ${e.inbound_count||0} in / ${e.outbound_count||0} out` : "single message";
+    const follow = e.follow_up || {};
+    return `<div class="card conversation ${i===SEL?'sel':''}" data-i="${i}" id="card${i}">
       <div class="row1">
         ${scoreBadge}
         <div class="subj" onclick="openThread('${e.entry_id}')">${esc(e.subject||"(no subject)")}</div>
-        <div class="date">${esc(e.date||"")}</div>
+        <div class="date">${esc(conversationDate(e))}</div>
       </div>
-      <div class="from">${esc(e.from||"")}</div>
-      <div class="snip">${esc(e.snippet||"")}</div>
-      <div class="chips">${unreadChip}${attChip}${reasons}${labels}</div>
+      <div class="convMeta"><span>${esc(conversationFrom(e))}</span><span>${esc(meta)}</span><span>${esc((e.participants||[]).slice(0,4).join("; "))}</span></div>
+      <div class="insight">${esc(conversationSnippet(e))}</div>
+      ${follow.hint && follow.state!=="none" ? `<div class="suggest">${esc(follow.hint)}</div>` : `<div class="suggest">${esc(e.suggested_action||"")}</div>`}
+      ${questionHtml}
+      <div class="chips">${followChip(follow)}${unreadChip}${attChip}${themes}${reasons}${labels}</div>
       <div class="actions">
-        <button onclick="openThread('${e.entry_id}')">Open</button>
-        <button onclick="replyTo('${e.entry_id}', false)">↩ Reply</button>
-        <button onclick="act('archive','${e.entry_id}',${i})">🗄 Archive</button>
-        <button onclick="markDone('${e.entry_id}',${i})">✓ Done</button>
-        <button class="danger" onclick="act('trash','${e.entry_id}',${i})">🗑 Trash</button>
+        <button onclick="openThread('${e.entry_id}')">Open conversation</button>
+        <button onclick="replyTo('${e.entry_id}', false)">Reply</button>
+        <button onclick="act('archive','${e.entry_id}',${i})">Archive latest</button>
+        <button onclick="markDone('${e.entry_id}',${i})">Done</button>
+        <button class="danger" onclick="act('trash','${e.entry_id}',${i})">Trash latest</button>
       </div>
     </div>`;
   }).join("");
@@ -288,25 +364,37 @@ async function markDone(entry_id, i){
 async function openThread(entry_id){
   const ov = document.getElementById("readerOverlay");
   const m = document.getElementById("readerModal");
-  m.innerHTML = '<div class="empty"><span class="spinner"></span> loading thread…</div>';
+  const current = ITEMS.find(x=>x.entry_id===entry_id) || {};
+  m.innerHTML = '<div class="empty"><span class="spinner"></span> loading conversation...</div>';
   ov.classList.add("open");
-  // mark read in background
+  // mark the latest anchor message read in background
   post("/api/mark", {entry_id, read:true}).then(loadUnread);
-  const d = await get(`/api/thread?entry_id=${encodeURIComponent(entry_id)}`);
-  if(!d.success){ m.innerHTML = `<div class="empty">⚠️ ${esc(d.message||"error")}</div>`; return; }
+  const d = await get(`/api/thread?entry_id=${encodeURIComponent(entry_id)}&days=${currentDays()}`);
+  if(!d.success){ m.innerHTML = `<div class="empty">Warning: ${esc(d.message||"error")}</div>`; return; }
+  const follow = current.follow_up || {};
+  const questions = (current.open_questions||[]).map(q=>
+    `<div class="question"><b>${esc(q.from||"Question")}</b>: ${esc(q.question||"")}</div>`
+  ).join("");
+  const insight = (current.insight_summary || current.suggested_action || follow.hint) ? `
+    <div class="suggest">
+      <b>${esc(current.suggested_action||follow.label||"Insight")}</b><br>
+      ${esc(follow.hint || current.insight_summary || "")}
+    </div>
+    ${questions}` : "";
   const msgs = (d.messages||[]).map(x=>`
     <div class="msg">
-      <div class="h"><b>${esc(x.from||"")}</b><span class="grow"></span>${esc(x.date||"")}${x.has_attachments?" 📎":""}</div>
+      <div class="h"><b>${esc(x.from||"")}</b><span class="grow"></span>${esc(x.date||"")}${x.has_attachments?" attachment":""}</div>
       <div class="body">${esc(x.snippet||"")}</div>
     </div>`).join("");
   m.innerHTML = `
-    <h2>${esc(d.subject||"(no subject)")}</h2>
-    <div class="meta">${(d.participants||[]).map(esc).join(" • ")} — ${d.message_count} message(s)</div>
-    ${msgs || '<div class="muted">No messages found in window.</div>'}
+    <h2>${esc(d.subject||current.subject||"(no subject)")}</h2>
+    <div class="meta">${(d.participants||current.participants||[]).map(esc).join(" | ")} - ${d.message_count} message(s)</div>
+    ${insight}
+    ${msgs || '<div class="muted">No messages found in this window.</div>'}
     <div class="modal-actions">
-      <button onclick="replyTo('${entry_id}', false); closeModal('readerOverlay')">↩ Reply</button>
-      <button onclick="replyTo('${entry_id}', true); closeModal('readerOverlay')">↩ Reply all</button>
-      <button onclick="forwardTo('${entry_id}'); closeModal('readerOverlay')">➡ Forward</button>
+      <button onclick="replyTo('${entry_id}', false); closeModal('readerOverlay')">Reply</button>
+      <button onclick="replyTo('${entry_id}', true); closeModal('readerOverlay')">Reply all</button>
+      <button onclick="forwardTo('${entry_id}'); closeModal('readerOverlay')">Forward</button>
       <button onclick="closeModal('readerOverlay')">Close</button>
     </div>`;
 }

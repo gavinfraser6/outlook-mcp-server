@@ -26,7 +26,9 @@ from __future__ import annotations
 import datetime
 import functools
 import os
+import re
 import sys
+from collections import Counter
 from typing import Any, Callable, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -266,9 +268,345 @@ def _from_field(email: Dict[str, Any]) -> str:
     return f"{name} <{addr}>".strip() if addr else name
 
 
+REQUEST_PHRASES = (
+    "can you", "could you", "would you", "will you", "please", "pls",
+    "let me know", "feedback", "follow up", "send me", "share", "review",
+    "confirm", "approve", "approval", "need your", "need you to",
+    "waiting for", "respond", "reply", "sign off", "sign-off",
+)
+
+
+def _email_dt(email: Dict[str, Any]) -> datetime.datetime:
+    """Best-effort comparable timestamp for a formatted email record."""
+    parsed = [
+        dt for dt in (
+            H._parse_received(email.get("received_time")),
+            H._parse_received(email.get("sent_time")),
+        )
+        if dt is not None
+    ]
+    return max(parsed) if parsed else datetime.datetime.min
+
+
+def _email_date(email: Dict[str, Any]) -> Optional[str]:
+    return email.get("sent_time") or email.get("received_time")
+
+
+def _email_from_me(email: Dict[str, Any], my_email: Optional[str]) -> bool:
+    if "from_me" in email:
+        return bool(email.get("from_me"))
+    sender_email = (email.get("sender_email") or "").lower()
+    return bool(my_email and my_email.lower() in sender_email)
+
+
+def _message_text(email: Dict[str, Any]) -> str:
+    return "\n".join([
+        email.get("subject") or "",
+        email.get("body") or "",
+        email.get("snippet") or "",
+    ]).lower()
+
+
+def _message_has_request(email: Dict[str, Any]) -> bool:
+    body = (email.get("body") or email.get("snippet") or "").lower()
+    text = _message_text(email)
+    return (
+        "?" in body
+        or any(phrase in text for phrase in REQUEST_PHRASES)
+        or any(word in text for word in H.APPROVAL_KEYWORDS)
+        or any(word in text for word in H.DEADLINE_KEYWORDS)
+    )
+
+
+def _base_subject(subject: Optional[str]) -> str:
+    out = (subject or "(no subject)").strip() or "(no subject)"
+    for _ in range(8):
+        lowered = out.lower()
+        for prefix in ("re:", "fw:", "fwd:"):
+            if lowered.startswith(prefix):
+                out = out[len(prefix):].strip() or "(no subject)"
+                break
+        else:
+            return out
+    return out
+
+
+def _conversation_themes(messages: List[Dict[str, Any]]) -> List[str]:
+    text = "\n".join(_message_text(m) for m in messages)
+    themes: List[str] = []
+    checks = (
+        ("urgent", H.URGENT_KEYWORDS),
+        ("deadline", H.DEADLINE_KEYWORDS),
+        ("money", H.MONEY_KEYWORDS),
+        ("approval", H.APPROVAL_KEYWORDS),
+        ("meeting", H.MEETING_KEYWORDS),
+    )
+    for label, words in checks:
+        if any(word in text for word in words):
+            themes.append(label)
+    if any("?" in (m.get("body") or m.get("snippet") or "") for m in messages):
+        themes.append("questions")
+    if any(m.get("has_attachments") for m in messages):
+        themes.append("attachments")
+    if any(m.get("unread") for m in messages):
+        themes.append("unread")
+    if any(m.get("flagged") == "flagged" for m in messages):
+        themes.append("flagged")
+    if any(m.get("importance") == "High" for m in messages):
+        themes.append("high importance")
+    return themes
+
+
+def _compact_question(text: str) -> str:
+    text = " ".join((text or "").split())
+    if "?" not in text:
+        return H.make_snippet(text, 180)
+    for part in re.split(r"(?<=\?)\s+", text):
+        if "?" in part:
+            return H.make_snippet(part, 180)
+    return H.make_snippet(text, 180)
+
+
+def _open_questions(messages: List[Dict[str, Any]], my_email: Optional[str]) -> List[Dict[str, Any]]:
+    questions: List[Dict[str, Any]] = []
+    for email in reversed(messages):
+        text = email.get("body") or email.get("snippet") or ""
+        if "?" not in text:
+            continue
+        questions.append({
+            "from": "You" if _email_from_me(email, my_email) else (_from_field(email) or "Someone"),
+            "date": _email_date(email),
+            "question": _compact_question(text),
+        })
+        if len(questions) >= 3:
+            break
+    return questions
+
+
+def _age_days(email: Dict[str, Any], now: datetime.datetime) -> int:
+    dt = _email_dt(email)
+    if dt == datetime.datetime.min:
+        return 0
+    return max(0, int((now - dt).total_seconds() // 86400))
+
+
+def _follow_up_state(
+    messages: List[Dict[str, Any]],
+    my_email: Optional[str],
+    follow_up_days: int,
+    now: datetime.datetime,
+) -> Dict[str, Any]:
+    last_outbound_idx: Optional[int] = None
+    for idx, email in enumerate(messages):
+        if _email_from_me(email, my_email):
+            last_outbound_idx = idx
+
+    inbound_after_last_outbound = messages[(last_outbound_idx + 1) if last_outbound_idx is not None else 0:]
+    inbound_requests = [
+        email for email in inbound_after_last_outbound
+        if not _email_from_me(email, my_email) and _message_has_request(email)
+    ]
+    if inbound_requests:
+        email = inbound_requests[-1]
+        age = _age_days(email, now)
+        due = age >= follow_up_days
+        sender = _from_field(email) or "the sender"
+        return {
+            "state": "reply_owed",
+            "direction": "them_to_you",
+            "label": "Reply owed",
+            "due": due,
+            "age_days": age,
+            "entry_id": email.get("id"),
+            "hint": f"{sender} asked for something {age} day(s) ago; send a reply or explicitly close the loop.",
+        }
+
+    if last_outbound_idx is not None:
+        email = messages[last_outbound_idx]
+        if _message_has_request(email):
+            age = _age_days(email, now)
+            due = age >= follow_up_days
+            return {
+                "state": "waiting_on_them",
+                "direction": "you_to_them",
+                "label": "Waiting on them",
+                "due": due,
+                "age_days": age,
+                "entry_id": email.get("id"),
+                "hint": f"You asked for something {age} day(s) ago and no later response is in this conversation.",
+            }
+
+    latest = messages[-1] if messages else {}
+    if latest and _email_from_me(latest, my_email):
+        age = _age_days(latest, now)
+        due = age >= follow_up_days
+        return {
+            "state": "last_from_you",
+            "direction": "you_to_them",
+            "label": "Last from you",
+            "due": due,
+            "age_days": age,
+            "entry_id": latest.get("id"),
+            "hint": "No later response is visible in this conversation.",
+        }
+
+    return {
+        "state": "none",
+        "direction": "none",
+        "label": "No follow-up due",
+        "due": False,
+        "age_days": 0,
+        "entry_id": None,
+        "hint": "No unanswered request was detected in this conversation.",
+    }
+
+
+def _conversation_timeline(
+    messages: List[Dict[str, Any]],
+    my_email: Optional[str],
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for email in messages[-limit:]:
+        msg = _thread_msg(email)
+        from_me = _email_from_me(email, my_email)
+        msg["from_me"] = from_me
+        msg["direction"] = "outbound" if from_me else "inbound"
+        out.append(msg)
+    return out
+
+
+def _conversation_insight(
+    messages: List[Dict[str, Any]],
+    *,
+    manager_name: Optional[str],
+    my_email: Optional[str],
+    follow_up_days: int,
+    now: datetime.datetime,
+) -> Dict[str, Any]:
+    messages = sorted(messages, key=_email_dt)
+    for email in messages:
+        email["from_me"] = _email_from_me(email, my_email)
+
+    latest = messages[-1]
+    scored = H.rank_for_triage(messages, manager_name=manager_name,
+                               my_email=my_email, now=now)
+    max_score = max((int(e.get("triage_score") or 0) for e in scored), default=0)
+
+    reasons: List[str] = []
+    for email in scored:
+        for reason in email.get("triage_reasons") or []:
+            if reason not in reasons:
+                reasons.append(reason)
+            if len(reasons) >= 6:
+                break
+        if len(reasons) >= 6:
+            break
+
+    participants: List[str] = []
+    for email in messages:
+        person = "You" if _email_from_me(email, my_email) else _from_field(email)
+        if person and person not in participants:
+            participants.append(person)
+
+    unread_count = sum(1 for email in messages if email.get("unread") and not _email_from_me(email, my_email))
+    inbound_count = sum(1 for email in messages if not _email_from_me(email, my_email))
+    outbound_count = len(messages) - inbound_count
+    attachment_count = sum(int(email.get("attachment_count") or 0) for email in messages)
+    themes = _conversation_themes(messages)
+    follow_up = _follow_up_state(messages, my_email, follow_up_days, now)
+
+    attention_score = max_score + min(unread_count, 3) * 2
+    if len(messages) > 1:
+        attention_score += min(len(messages), 5) - 1
+    if follow_up["state"] == "reply_owed":
+        attention_score += 8 if follow_up.get("due") else 5
+        if "reply owed" not in reasons:
+            reasons.insert(0, "reply owed")
+    elif follow_up["state"] == "waiting_on_them":
+        attention_score += 6 if follow_up.get("due") else 3
+        if "waiting on response" not in reasons:
+            reasons.insert(0, "waiting on response")
+    elif follow_up["state"] == "last_from_you" and follow_up.get("due"):
+        attention_score += 2
+        if "last message was yours" not in reasons:
+            reasons.append("last message was yours")
+
+    latest_from = "You" if _email_from_me(latest, my_email) else _from_field(latest)
+    if follow_up["state"] == "reply_owed":
+        suggested = "Reply to the open request or mark it handled."
+    elif follow_up["state"] == "waiting_on_them":
+        suggested = "Send a follow-up if this is still needed."
+    elif unread_count:
+        suggested = "Read the latest unread message and decide whether to reply."
+    elif attachment_count:
+        suggested = "Review the attachment context before archiving."
+    else:
+        suggested = "No immediate action detected; keep for context or archive."
+
+    theme_text = ", ".join(themes[:4]) if themes else "general mail"
+    summary = (
+        f"{len(messages)} message(s), {inbound_count} inbound and {outbound_count} outbound. "
+        f"Latest from {latest_from}. Main signals: {theme_text}."
+    )
+
+    return {
+        "conversation_id": latest.get("conversation_id") or latest.get("id"),
+        "thread_id": latest.get("conversation_id"),
+        "entry_id": latest.get("id"),
+        "subject": _base_subject(latest.get("subject") or messages[0].get("subject")),
+        "participants": participants[:8],
+        "message_count": len(messages),
+        "inbound_count": inbound_count,
+        "outbound_count": outbound_count,
+        "unread_count": unread_count,
+        "attachment_count": attachment_count,
+        "latest_from": latest_from,
+        "latest_date": _email_date(latest),
+        "latest_snippet": latest.get("snippet"),
+        "attention_score": max(0, attention_score),
+        "triage_score": max(0, attention_score),
+        "triage_reasons": reasons[:7],
+        "themes": themes,
+        "follow_up": follow_up,
+        "open_questions": _open_questions(messages, my_email),
+        "insight_summary": summary,
+        "suggested_action": suggested,
+        "timeline": _conversation_timeline(messages, my_email),
+        "_latest_record": latest,
+    }
+
+
+def _conversation_mailbox_summary(
+    conversations: List[Dict[str, Any]],
+    *,
+    days: int,
+    scanned: int,
+    capped: bool,
+) -> Dict[str, Any]:
+    theme_counts: Counter = Counter()
+    for conv in conversations:
+        theme_counts.update(conv.get("themes") or [])
+    return {
+        "scan_window_days": days,
+        "messages_scanned": scanned,
+        "scan_capped": capped,
+        "total_conversations": len(conversations),
+        "reply_owed": sum(1 for c in conversations if c.get("follow_up", {}).get("state") == "reply_owed"),
+        "waiting_on_them": sum(1 for c in conversations if c.get("follow_up", {}).get("state") == "waiting_on_them"),
+        "unread_conversations": sum(1 for c in conversations if c.get("unread_count", 0) > 0),
+        "high_attention": sum(1 for c in conversations if c.get("attention_score", 0) >= 10),
+        "top_themes": [
+            {"theme": theme, "count": count}
+            for theme, count in theme_counts.most_common(6)
+        ],
+    }
+
+
 def _fetch_emails(folder, days: int, *, unread_only: bool = False,
                   subject: Optional[str] = None, include_body: bool = True,
-                  scan_cap: int = MAX_SCAN) -> Tuple[List[Dict[str, Any]], bool]:
+                  scan_cap: int = MAX_SCAN,
+                  date_field: str = "ReceivedTime") -> Tuple[List[Dict[str, Any]], bool]:
     """Fetch + format emails newer than ``days`` from a folder, newest first.
 
     Optimised for busy mailboxes: pushes a date floor (and, when safe, an
@@ -281,14 +619,17 @@ def _fetch_emails(folder, days: int, *, unread_only: bool = False,
     threshold = now - datetime.timedelta(days=days)
     items = folder.Items
     try:
-        items.Sort("[ReceivedTime]", True)  # newest first
+        items.Sort(f"[{date_field}]", True)  # newest first
     except Exception:
         pass
 
     # Push safe filters to Outlook (huge win on large folders). Falls back to
     # an unrestricted scan if the provider rejects the filter.
-    restriction = H.build_inbox_restriction(
-        threshold=threshold, unread_only=unread_only, subject=subject)
+    if date_field == "ReceivedTime":
+        restriction = H.build_inbox_restriction(
+            threshold=threshold, unread_only=unread_only, subject=subject)
+    else:
+        restriction = f"[{date_field}] >= '{threshold.strftime('%m/%d/%Y %I:%M %p')}'"
     if restriction:
         try:
             items = items.Restrict(restriction)
@@ -308,7 +649,9 @@ def _fetch_emails(folder, days: int, *, unread_only: bool = False,
             capped = True
             break
         try:
-            received = H._safe_getattr(item, "ReceivedTime")
+            received = (H._safe_getattr(item, date_field)
+                        or H._safe_getattr(item, "ReceivedTime")
+                        or H._safe_getattr(item, "SentOn"))
             if received is not None and received.replace(tzinfo=None) < threshold:
                 # Sorted newest-first: once we cross the floor, stop.
                 break
@@ -1355,6 +1698,149 @@ def triage_inbox(days: int = 3, max_results: int = 20,
         results=results,
         next_safe_action="Open the top item with get_email_by_number, then draft a "
                          "reply or archive it. Sending always needs confirmation.",
+    )
+
+
+@mcp.tool()
+@email_tool
+def conversation_insights(
+    days: int = H.MAX_DAYS,
+    max_results: int = 40,
+    offset: int = 0,
+    folder_name: Optional[str] = None,
+    unread_only: bool = False,
+    keyword: Optional[str] = None,
+    sender: Optional[str] = None,
+    subject: Optional[str] = None,
+    recipient: Optional[str] = None,
+    has_attachments: Optional[bool] = None,
+    category: Optional[str] = None,
+    exact_phrase: Optional[str] = None,
+    exclude: Optional[str] = None,
+    include_sent: bool = True,
+    follow_up_days: int = 3,
+) -> str:
+    """[READ-ONLY] Deep, conversation-level mailbox insight for the web manager.
+
+    Scans a broad window (default: the maximum supported look-back), gathers
+    Inbox plus Sent Items, groups by Outlook conversation id, and returns one
+    ranked insight object per conversation instead of one card per message.
+    Follow-up hints are bidirectional: the tool flags both conversations where
+    you asked for something and have not received feedback, and conversations
+    where someone asked you for something and you have not responded.
+    """
+    _validate_days(days, H.MAX_DAYS)
+    if not isinstance(follow_up_days, int) or follow_up_days < 1:
+        raise OutlookError(ErrorCode.INVALID_PARAMETER,
+                           "'follow_up_days' must be a positive integer.")
+
+    namespace = _namespace()
+    manager = _get_manager_name(namespace)
+    my_email = _get_my_email(namespace)
+    folder, folder_disp = _require_folder(namespace, folder_name)
+    max_results = max(1, min(int(max_results), H.MAX_PAGE_SIZE))
+    scan_cap = min(MAX_SCAN, max(400, max_results * 12))
+
+    primary_emails, primary_capped = _fetch_emails(
+        folder, days, include_body=True, scan_cap=scan_cap)
+
+    records: Dict[str, Dict[str, Any]] = {}
+
+    def add_record(email: Dict[str, Any], source: str, from_me: Optional[bool] = None) -> None:
+        record = dict(email)
+        record["source_folder"] = source
+        if from_me is not None:
+            record["from_me"] = from_me
+        else:
+            record["from_me"] = _email_from_me(record, my_email)
+        key = record.get("id") or f"{source}:{len(records)}"
+        records[key] = record
+
+    for email in primary_emails:
+        add_record(email, folder_disp)
+
+    sent_capped = False
+    if include_sent:
+        try:
+            sent = namespace.GetDefaultFolder(H.OL_FOLDER_SENT)
+            sent_emails, sent_capped = _fetch_emails(
+                sent, days, include_body=True, scan_cap=scan_cap,
+                date_field="SentOn")
+            for email in sent_emails:
+                add_record(email, "Sent Items", from_me=True)
+        except Exception as exc:
+            log.debug("Could not scan Sent Items for conversation insights: %s", exc)
+
+    exclude_terms = [t.strip() for t in (exclude or "").split(",") if t.strip()]
+    filters_active = any([
+        keyword, sender, subject, recipient, unread_only,
+        has_attachments is not None, category, exact_phrase, exclude_terms,
+    ])
+
+    def matches_filters(email: Dict[str, Any]) -> bool:
+        return H.email_matches(
+            email, keyword=keyword, sender=sender, subject=subject,
+            recipient=recipient, unread_only=unread_only,
+            has_attachments=has_attachments, category=category,
+            exact_phrase=exact_phrase, exclude=exclude_terms or None,
+        )
+
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for email in records.values():
+        key = email.get("conversation_id") or email.get("id") or f"message:{len(groups)}"
+        groups.setdefault(key, []).append(email)
+
+    now = datetime.datetime.now()
+    conversations: List[Dict[str, Any]] = []
+    for messages in groups.values():
+        if filters_active and not any(matches_filters(email) for email in messages):
+            continue
+        conversations.append(_conversation_insight(
+            messages, manager_name=manager, my_email=my_email,
+            follow_up_days=follow_up_days, now=now))
+
+    conversations.sort(
+        key=lambda conv: (conv.get("attention_score", 0), conv.get("latest_date") or ""),
+        reverse=True,
+    )
+    summary = _conversation_mailbox_summary(
+        conversations, days=days, scanned=len(records),
+        capped=primary_capped or sent_capped)
+
+    page, page_info = H.paginate(conversations, offset, max_results)
+    latest_records = []
+    for conv in page:
+        latest = conv.pop("_latest_record", None)
+        if latest:
+            latest_records.append(latest)
+    _cache_listing(latest_records)
+    for i, conv in enumerate(page, 1):
+        conv["email_number"] = i
+
+    return make_success(
+        action="conversation_insights",
+        folder=folder_disp,
+        days=days,
+        follow_up_days=follow_up_days,
+        scanned=len(records),
+        capped=primary_capped or sent_capped,
+        query={
+            "keyword": keyword, "sender": sender, "subject": subject,
+            "recipient": recipient, "unread_only": unread_only,
+            "has_attachments": has_attachments, "category": category,
+            "exact_phrase": exact_phrase, "exclude": exclude_terms,
+            "include_sent": include_sent,
+        },
+        mailbox_insights=summary,
+        page_info=page_info,
+        count=len(page),
+        conversations=page,
+        analysis_instructions=(
+            "Use the conversation objects as the primary work queue. Prioritise "
+            "reply_owed, waiting_on_them, unread, deadline, approval and money "
+            "signals before low-context single-message mail."
+        ),
+        next_safe_action="Open a conversation with read_thread(entry_id=...) before replying.",
     )
 
 

@@ -7,6 +7,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+import outlook_helpers as H
 import outlook_web
 
 
@@ -35,6 +36,17 @@ class TestReadOnly:
         r = c.get("/")
         assert r.status_code == 200
         assert "Outlook Assistant" in r.text
+        assert "Conversations" in r.text
+        assert "Follow-up" in r.text
+
+    def test_favicon_204_has_no_body(self, client):
+        # A 204 must carry no body — a JSON body here makes uvicorn raise
+        # "Response content longer than Content-Length" behind the middleware.
+        c, ns, outlook = client
+        r = c.get("/favicon.ico")
+        assert r.status_code == 204
+        assert r.content == b""
+        assert r.headers.get("content-length") in (None, "0")
 
     def test_unread_count(self, client):
         c, ns, outlook = client
@@ -54,6 +66,16 @@ class TestReadOnly:
         c, ns, outlook = client
         r = c.get("/api/search?keyword=invoice&days=30")
         assert r.json()["page_info"]["total_matched"] == 1
+
+    def test_insights_default_to_deep_conversation_window(self, client):
+        c, ns, outlook = client
+        r = c.get("/api/insights")
+        body = r.json()
+        assert body["success"] is True
+        assert body["action"] == "conversation_insights"
+        assert body["days"] == H.MAX_DAYS
+        assert "mailbox_insights" in body
+        assert "conversations" in body
 
     def test_email_and_thread(self, client):
         c, ns, outlook = client

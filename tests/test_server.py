@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 
 import pytest
@@ -98,6 +99,93 @@ class TestSearch:
         s, ns, outlook = server
         out = _load(s.count_unread_emails())
         assert out["unread_count"] == 2
+
+
+# --- conversation insights -------------------------------------------------
+
+class TestConversationInsights:
+    def test_groups_messages_into_conversations(self, server):
+        from conftest import FakeMail
+
+        s, ns, outlook = server
+        now = datetime.datetime.now()
+        follow_on = FakeMail(
+            entry_id="A2",
+            subject="Re: Invoice #42 due Friday",
+            sender_name="Acme Billing",
+            sender_email="billing@acme.com",
+            body="Can you confirm payment today?",
+            received=now - datetime.timedelta(minutes=20),
+            unread=True,
+            conversation_id="C1",
+        )
+        ns.GetDefaultFolder(H.OL_FOLDER_INBOX).Items.append(follow_on)
+        ns.register(follow_on)
+
+        out = _load(s.conversation_insights(days=30, max_results=10))
+
+        assert out["success"] is True
+        conv = next(c for c in out["conversations"] if c["conversation_id"] == "C1")
+        assert conv["message_count"] == 2
+        assert conv["subject"] == "Invoice #42 due Friday"
+        assert conv["unread_count"] == 2
+        assert conv["follow_up"]["state"] == "reply_owed"
+
+    def test_follow_up_hints_are_bidirectional(self, server, monkeypatch):
+        from conftest import FakeMail
+
+        s, ns, outlook = server
+        monkeypatch.setattr(s, "_get_my_email", lambda namespace: "me@example.com")
+        now = datetime.datetime.now()
+        inbox = ns.GetDefaultFolder(H.OL_FOLDER_INBOX).Items
+        sent = ns.GetDefaultFolder(H.OL_FOLDER_SENT).Items
+
+        older_inbound = FakeMail(
+            entry_id="F1", subject="Client proposal",
+            sender_name="Client", sender_email="client@example.com",
+            body="The proposal looks possible.",
+            received=now - datetime.timedelta(days=5),
+            unread=False, conversation_id="CFOLLOW",
+        )
+        my_request = FakeMail(
+            entry_id="S1", subject="Re: Client proposal",
+            sender_name="Me", sender_email="me@example.com",
+            body="Can you send feedback on the proposal?",
+            received=now - datetime.timedelta(days=4),
+            sent=now - datetime.timedelta(days=4),
+            unread=False, conversation_id="CFOLLOW",
+        )
+        my_update = FakeMail(
+            entry_id="S2", subject="Draft approval",
+            sender_name="Me", sender_email="me@example.com",
+            body="Here is the draft.",
+            received=now - datetime.timedelta(days=3),
+            sent=now - datetime.timedelta(days=3),
+            unread=False, conversation_id="CREPLY",
+        )
+        their_request = FakeMail(
+            entry_id="F2", subject="Re: Draft approval",
+            sender_name="Partner", sender_email="partner@example.com",
+            body="Can you approve this by Friday?",
+            received=now - datetime.timedelta(days=2),
+            unread=True, conversation_id="CREPLY",
+        )
+        for mail in (older_inbound, their_request):
+            inbox.append(mail)
+            ns.register(mail)
+        for mail in (my_request, my_update):
+            sent.append(mail)
+            ns.register(mail)
+
+        out = _load(s.conversation_insights(days=30, max_results=20, follow_up_days=2))
+        by_id = {c["conversation_id"]: c for c in out["conversations"]}
+
+        assert by_id["CFOLLOW"]["follow_up"]["state"] == "waiting_on_them"
+        assert by_id["CFOLLOW"]["follow_up"]["due"] is True
+        assert by_id["CREPLY"]["follow_up"]["state"] == "reply_owed"
+        assert by_id["CREPLY"]["follow_up"]["due"] is True
+        assert out["mailbox_insights"]["waiting_on_them"] >= 1
+        assert out["mailbox_insights"]["reply_owed"] >= 1
 
 
 # --- reading ---------------------------------------------------------------

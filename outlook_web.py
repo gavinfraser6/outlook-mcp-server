@@ -35,7 +35,7 @@ import threading
 from concurrent.futures import Future
 from typing import Any, Awaitable, Callable, Dict, Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
 import outlook_helpers as H
@@ -169,7 +169,10 @@ def create_app(call: CallFn) -> FastAPI:
 
     @app.get("/favicon.ico")
     async def favicon():
-        return JSONResponse({}, status_code=204)
+        # 204 No Content MUST carry no body; returning a JSON body here makes
+        # uvicorn raise "Response content longer than Content-Length" (the
+        # streaming auth middleware re-emits the body against a 0-length 204).
+        return Response(status_code=204)
 
     # ---- read-only --------------------------------------------------------
     @app.get("/api/health")
@@ -199,6 +202,23 @@ def create_app(call: CallFn) -> FastAPI:
         return await call(omcp.triage_inbox, days=days, max_results=limit,
                           unread_only=unread_only, folder_name=folder)
 
+    @app.get("/api/insights")
+    async def insights(days: int = H.MAX_DAYS, limit: int = 40, offset: int = 0,
+                       unread_only: bool = False, folder: Optional[str] = None,
+                       keyword: Optional[str] = None, sender: Optional[str] = None,
+                       subject: Optional[str] = None, recipient: Optional[str] = None,
+                       has_attachments: Optional[bool] = None,
+                       category: Optional[str] = None,
+                       exact_phrase: Optional[str] = None, exclude: Optional[str] = None,
+                       follow_up_days: int = 3):
+        return await call(omcp.conversation_insights, days=days, max_results=limit,
+                          offset=offset, unread_only=unread_only, folder_name=folder,
+                          keyword=keyword, sender=sender, subject=subject,
+                          recipient=recipient, has_attachments=has_attachments,
+                          category=category, exact_phrase=exact_phrase,
+                          exclude=exclude, include_sent=True,
+                          follow_up_days=follow_up_days)
+
     @app.get("/api/search")
     async def search(keyword: Optional[str] = None, sender: Optional[str] = None,
                      subject: Optional[str] = None, days: int = 14,
@@ -215,7 +235,7 @@ def create_app(call: CallFn) -> FastAPI:
         return await call(omcp.get_email_by_number, entry_id=entry_id)
 
     @app.get("/api/thread")
-    async def thread(entry_id: str, days: int = 60):
+    async def thread(entry_id: str, days: int = H.MAX_DAYS):
         return await call(omcp.read_thread, entry_id=entry_id, days=days)
 
     @app.get("/api/attachments")
